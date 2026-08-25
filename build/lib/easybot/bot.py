@@ -1,0 +1,2263 @@
+#!/usr/bin/env python3
+"""
+EasyBot SDK Bot 主类模块
+
+提供机器人核心功能，包括：
+- 生命周期管理
+- 事件处理器注册
+- 协议管理
+"""
+
+import asyncio
+import importlib.util
+import os
+import sys
+from collections.abc import Awaitable, Callable, Iterable
+from pathlib import Path
+from re import Pattern
+from typing import TYPE_CHECKING
+
+from ._internal.constants import EVENT_DISPLAY_NAMES
+from ._internal.event_dispatcher import DEFAULT_MAX_CONCURRENCY, EventDispatcher
+from ._internal.intent import (
+    EVENT_INTENT_MAP,
+    Intent,
+    IntentCalculator,
+    get_event_types_by_intent,
+)
+from ._internal.lifecycle import LifecycleManager
+from .api import API
+from .logger import Logger
+from .plugins import BotAdminManager, CommandValidScenes, Plugins
+from .protocol import Proto, Protocol
+from .sandbox import SandBox
+from .session import SessionManager
+from .version import __version__
+
+if TYPE_CHECKING:
+    from .models import Model
+    from .plugins import BotCommandObject, PluginReloadResult, PluginStats
+
+
+class Bot:
+    """
+    QQ 机器人主类
+
+    示例:
+        # WebSocket 模式（默认）
+        bot = Bot(
+            app_id="your_appid",
+            app_secret="your_secret"
+        )
+
+        # Webhook 模式
+        bot = Bot(
+            app_id="your_appid",
+            app_secret="your_secret",
+            protocol=Proto.webhook(port=8080)
+        )
+
+        @bot.on_guild_message
+        async def handle_message(msg):
+            await bot.api.send_guild_message(
+                channel_id=msg.channel_id,
+                content="收到消息！"
+            )
+
+        bot.start()
+    """
+
+    def __init__(
+        self,
+        app_id: str,
+        app_secret: str,
+        is_private: bool = False,
+        is_sandbox: bool = False,
+        sandbox: SandBox | None = None,
+        protocol: Protocol | None = None,
+        is_retry: int = 3,
+        is_log_error: bool = True,
+        no_permission_warning: bool = True,
+        api_timeout: int = 20,
+        is_debug: bool = False,
+        auto_load_plugins: bool = False,
+        plugins_dir: str = "plugins",
+        plugins_recursive: bool = False,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    ):
+        """
+        初始化机器人
+
+        Args:
+            app_id: 机器人 AppID
+            app_secret: 机器人密钥
+            is_private: 是否私域机器人，默认为公域
+            is_sandbox: 是否开启沙箱环境测试
+            sandbox: 沙箱环境配置
+            protocol: 协议配置，默认为 Proto.websocket()
+            is_retry: API 重试次数，默认 3 次
+            is_log_error: 是否自动记录 API 错误，默认开启
+            no_permission_warning: 是否开启权限不足警告，默认开启
+            api_timeout: API 请求超时时间（秒），默认 20 秒
+            is_debug: 是否开启调试模式，默认关闭
+            auto_load_plugins: 是否自动加载插件目录中的插件，默认False
+            plugins_dir: 插件目录路径，默认"plugins"
+            plugins_recursive: 是否递归扫描子目录加载插件，默认False
+            max_concurrency: 事件处理器/命令最大并发数，默认 64
+        """
+        self.app_id = app_id
+        self._app_secret = app_secret
+        self.is_private = is_private
+        self.is_sandbox = is_sandbox
+        self.sandbox = sandbox
+        self.is_retry = is_retry
+        self.is_log_error = is_log_error
+        self.no_permission_warning = no_permission_warning
+        self.api_timeout = api_timeout
+        self.is_debug = is_debug
+        self.auto_load_plugins = auto_load_plugins
+        self.plugins_dir = plugins_dir
+        self.plugins_recursive = plugins_recursive
+        self._plugins_path_added_to_syspath = False
+        self._pending_load_hooks: list[Callable] = []
+
+        self._bot_id: str | None = None
+        self._bot_admin_manager = BotAdminManager()
+
+        self.logger = Logger(bot_id=app_id, is_debug=is_debug, module_name="bot")
+
+        self.logger.info(
+            f"本次程序进程ID：{os.getpid()} | SDK版本：{__version__} | 即将开始运行机器人……"
+        )
+
+        self.protocol = protocol or Proto.websocket()
+
+        self._event_handlers: dict[str, Callable] = {}
+        self._intents = 0
+        self._intent_calculator = IntentCalculator()
+        self._running = False
+        self._event_dispatcher = EventDispatcher(
+            self, self.logger, max_concurrency=max_concurrency
+        )
+
+        self.api: API = API(self)
+
+        self._session_manager = SessionManager(self)
+        self._session_manager.set_api(self.api)
+
+        self._lifecycle = LifecycleManager(self, self.logger)
+
+        self.logger.debug(
+            f"Bot 初始化完成: is_private={is_private}, is_sandbox={is_sandbox}, "
+            f"protocol={type(self.protocol).__name__}, retry={is_retry}, timeout={api_timeout}s"
+        )
+
+        # 预加载插件以注册必要的Intent
+        if self.auto_load_plugins:
+            self._preload_plugins_for_intents()
+
+    def start(self) -> None:
+        """
+        启动机器人
+
+        使用初始化时配置的协议（WebSocket/Webhook/Remote Webhook）
+        这是一个阻塞方法，会一直运行直到机器人停止
+        """
+        try:
+            asyncio.run(self.start_async())
+        except KeyboardInterrupt:
+            self.logger.info("收到中断信号 (Ctrl+C)，正在停止...")
+        except Exception as e:
+            self.logger.exception(f"机器人运行时发生未捕获异常: {e}")
+
+    async def start_async(self) -> None:
+        """
+        异步启动机器人
+
+        适用于需要在外部管理事件循环的场景
+        """
+        self._running = True
+        self.logger.info(f"机器人正在启动... (AppID: {self.app_id})")
+
+        if self.is_debug:
+            self.logger.debug("调试模式已开启，将输出详细调试信息")
+            self.logger.debug(
+                f"计算后的 Intent 值: {self._intents} (0x{self._intents:X})"
+            )
+
+        await self._bot_admin_manager.initialize()
+
+        self._session_manager.start(asyncio.get_event_loop())
+
+        try:
+            await self.protocol.run(self)
+        finally:
+            await self.stop_async()
+
+    def stop(self) -> None:
+        """
+        停止机器人（同步版本）
+
+        注意：此方法仅设置停止标志，实际资源清理需要调用 stop_async()
+        """
+        self._running = False
+        self.logger.info("机器人停止标志已设置")
+
+    async def stop_async(self) -> None:
+        """
+        异步停止机器人并清理所有资源
+
+        包括：
+        - 触发关闭事件
+        - 取消所有活跃的事件处理任务
+        - 停止会话管理器后台任务
+        - 关闭 API HTTP 客户端
+        - 停止协议连接
+        - 释放所有网络资源
+        """
+        self._running = False
+
+        try:
+            await self._lifecycle.close()
+        except Exception as e:
+            self.logger.error(f"关闭生命周期管理器时出错: {e}")
+
+        try:
+            await self._event_dispatcher.cancel_all()
+        except Exception as e:
+            self.logger.error(f"取消事件处理任务时出错: {e}")
+
+        try:
+            await self._session_manager.stop()
+        except Exception as e:
+            self.logger.error(f"停止会话管理器时出错: {e}")
+
+        try:
+            await self.api.close()
+        except Exception as e:
+            self.logger.error(f"关闭 API 客户端时出错: {e}")
+
+        try:
+            await self._cleanup_all_plugins()
+        except Exception as e:
+            self.logger.error(f"清理插件资源时出错: {e}")
+
+        try:
+            await self.protocol.stop()
+        except Exception as e:
+            self.logger.error(f"停止协议时出错: {e}")
+
+        if self._plugins_path_added_to_syspath:
+            try:
+                plugins_dir_str = str(Path(self.plugins_dir).absolute())
+                if plugins_dir_str in sys.path:
+                    sys.path.remove(plugins_dir_str)
+                self._plugins_path_added_to_syspath = False
+            except (ValueError, OSError):
+                pass
+
+        self.logger.info("机器人已完全停止，所有资源已释放")
+
+    async def _cleanup_all_plugins(self) -> None:
+        """
+        遍历所有已加载插件，调用其 on_plugin_unload 钩子
+
+        Bot 关闭时自动调用，确保每个插件的卸载钩子都有机会执行清理。
+        与 unload_plugin 不同，此处不卸载命令/预处理器（因为进程即将退出），
+        仅触发资源清理回调。
+        """
+        loaded_plugins = Plugins.get_loaded_plugins()
+        if not loaded_plugins:
+            return
+
+        for plugin_name in loaded_plugins:
+            try:
+                module = sys.modules.get(plugin_name)
+                if module and hasattr(module, "on_plugin_unload"):
+                    hook = getattr(module, "on_plugin_unload")
+                    if asyncio.iscoroutinefunction(hook):
+                        await hook(self)
+                    else:
+                        hook(self)
+            except Exception as e:
+                self.logger.warning(
+                    f"插件 {plugin_name} 的 on_plugin_unload 钩子执行失败: {e}"
+                )
+
+    async def __aenter__(self) -> "Bot":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        await self.stop_async()
+        return False
+
+    def _register_handler(
+        self,
+        event_type: str,
+        func: Callable,
+        intent: int,
+    ) -> None:
+        """
+        注册事件处理器
+
+        Args:
+            event_type: 事件类型
+            func: 处理函数
+            intent: Intent 值
+        """
+        if event_type in self._event_handlers:
+            old_func = self._event_handlers[event_type]
+            display_name = EVENT_DISPLAY_NAMES.get(event_type, event_type)
+            self.logger.warning(
+                f"{display_name}事件处理器被覆盖: "
+                f"{old_func.__name__} -> {func.__name__}"
+            )
+        self._event_handlers[event_type] = func
+        self._intents |= intent
+        self._intent_calculator.register_event(event_type)
+        display_name = EVENT_DISPLAY_NAMES.get(event_type, event_type)
+        self.logger.info(f"{display_name}事件订阅成功")
+
+    @property
+    def on_guild_message(
+        self,
+    ) -> "Callable[[Callable[[Model.GuildMessage], Awaitable[None]]], Callable[[Model.GuildMessage], Awaitable[None]]]":
+        """
+        频道@机器人消息事件
+
+        事件类型: AT_MESSAGE_CREATE
+        Intent: PUBLIC_GUILD_MESSAGES (1<<30)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收频道消息事件对应的模型对象 `Model.GuildMessage`。
+
+        示例:
+            @bot.on_guild_message
+            async def handle_message(msg: Model.GuildMessage):
+                await bot.api.send_guild_message(
+                    channel_id=msg.channel_id,
+                    content=f"收到：{msg.content}"
+                )
+        """
+
+        def decorator(
+            func: "Callable[[Model.GuildMessage], Awaitable[None]]",
+        ) -> "Callable[[Model.GuildMessage], Awaitable[None]]":
+            self._register_handler(
+                "AT_MESSAGE_CREATE", func, Intent.PUBLIC_GUILD_MESSAGES
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_at_group_message(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupMessage], Awaitable[None]]], Callable[[Model.GroupMessage], Awaitable[None]]]":
+        """
+        群聊@机器人消息事件
+
+        事件类型: GROUP_AT_MESSAGE_CREATE
+        Intent: GROUP_AND_C2C_EVENT (1<<25)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收群聊消息事件对应的模型对象 `Model.GroupMessage`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.GroupMessage], Awaitable[None]]",
+        ) -> "Callable[[Model.GroupMessage], Awaitable[None]]":
+            self._register_handler(
+                "GROUP_AT_MESSAGE_CREATE", func, Intent.GROUP_AND_C2C_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_group_full_message(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupMessage], Awaitable[None]]], Callable[[Model.GroupMessage], Awaitable[None]]]":
+        """
+        群聊全量消息事件（需在 QQ 后台开启“全量群消息”权限）
+
+        事件类型: GROUP_MESSAGE_CREATE
+        Intent: GROUP_AND_C2C_EVENT (1<<25)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收群聊全量消息事件对应的模型对象 `Model.GroupMessage`。
+
+        示例:
+            @bot.on_group_full_message
+            async def handle_all(msg: Model.GroupMessage):
+                if msg.treated_msg == "ping":
+                    await msg.reply("pong")
+        """
+
+        def decorator(
+            func: "Callable[[Model.GroupMessage], Awaitable[None]]",
+        ) -> "Callable[[Model.GroupMessage], Awaitable[None]]":
+            self._register_handler(
+                "GROUP_MESSAGE_CREATE", func, Intent.GROUP_AND_C2C_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_group_message(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupMessage], Awaitable[None]]], Callable[[Model.GroupMessage], Awaitable[None]]]":
+        """兼容旧名称；等同于 on_group_full_message。"""
+        return self.on_group_full_message
+
+    @property
+    def on_c2c_message(
+        self,
+    ) -> "Callable[[Callable[[Model.C2CMessage], Awaitable[None]]], Callable[[Model.C2CMessage], Awaitable[None]]]":
+        """
+        单聊消息事件
+
+        事件类型: C2C_MESSAGE_CREATE
+        Intent: GROUP_AND_C2C_EVENT (1<<25)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收单聊消息事件对应的模型对象 `Model.C2CMessage`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.C2CMessage], Awaitable[None]]",
+        ) -> "Callable[[Model.C2CMessage], Awaitable[None]]":
+            self._register_handler(
+                "C2C_MESSAGE_CREATE", func, Intent.GROUP_AND_C2C_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_direct_message(
+        self,
+    ) -> "Callable[[Callable[[Model.DirectMessage], Awaitable[None]]], Callable[[Model.DirectMessage], Awaitable[None]]]":
+        """
+        频道私信消息事件
+
+        事件类型: DIRECT_MESSAGE_CREATE
+        Intent: DIRECT_MESSAGE (1<<12)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收频道私信事件对应的模型对象 `Model.DirectMessage`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.DirectMessage], Awaitable[None]]",
+        ) -> "Callable[[Model.DirectMessage], Awaitable[None]]":
+            self._register_handler("DIRECT_MESSAGE_CREATE", func, Intent.DIRECT_MESSAGE)
+            return func
+
+        return decorator
+
+    @property
+    def on_guild_full_message(
+        self,
+    ) -> "Callable[[Callable[[Model.GuildMessage], Awaitable[None]]], Callable[[Model.GuildMessage], Awaitable[None]]]":
+        """
+        频道全量消息事件（私域机器人）
+
+        事件类型: MESSAGE_CREATE
+        Intent: GUILD_MESSAGES (1<<9)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收频道全量消息事件对应的模型对象 `Model.GuildMessage`。
+
+        注意: 仅私域机器人可用
+        """
+
+        def decorator(
+            func: "Callable[[Model.GuildMessage], Awaitable[None]]",
+        ) -> "Callable[[Model.GuildMessage], Awaitable[None]]":
+            if not self.is_private:
+                self.logger.warning(
+                    f"on_guild_full_message 仅私域机器人可用，当前为公域机器人，"
+                    f"事件处理器 {func.__name__} 可能无法正常接收事件"
+                )
+            self._register_handler("MESSAGE_CREATE", func, Intent.GUILD_MESSAGES)
+            return func
+
+        return decorator
+
+    @property
+    def on_message_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.MessageDelete], Awaitable[None]]], Callable[[Model.MessageDelete], Awaitable[None]]]":
+        """
+        消息删除事件（私域机器人）
+
+        事件类型: MESSAGE_DELETE
+        Intent: GUILD_MESSAGES (1<<9)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收消息删除事件对应的模型对象 `Model.MessageDelete`。
+
+        注意: 仅私域机器人可用
+        """
+
+        def decorator(
+            func: "Callable[[Model.MessageDelete], Awaitable[None]]",
+        ) -> "Callable[[Model.MessageDelete], Awaitable[None]]":
+            if not self.is_private:
+                self.logger.warning(
+                    f"on_message_delete 仅私域机器人可用，当前为公域机器人，"
+                    f"事件处理器 {func.__name__} 可能无法正常接收事件"
+                )
+            self._register_handler("MESSAGE_DELETE", func, Intent.GUILD_MESSAGES)
+            return func
+
+        return decorator
+
+    @property
+    def on_public_message_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.MessageDelete], Awaitable[None]]], Callable[[Model.MessageDelete], Awaitable[None]]]":
+        """
+        公域消息删除事件
+
+        事件类型: PUBLIC_MESSAGE_DELETE
+        Intent: PUBLIC_GUILD_MESSAGES (1<<30)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收消息删除事件对应的模型对象 `Model.MessageDelete`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.MessageDelete], Awaitable[None]]",
+        ) -> "Callable[[Model.MessageDelete], Awaitable[None]]":
+            self._register_handler(
+                "PUBLIC_MESSAGE_DELETE", func, Intent.PUBLIC_GUILD_MESSAGES
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_direct_message_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.MessageDelete], Awaitable[None]]], Callable[[Model.MessageDelete], Awaitable[None]]]":
+        """
+        私信消息删除事件
+
+        事件类型: DIRECT_MESSAGE_DELETE
+        Intent: DIRECT_MESSAGE (1<<12)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收私信消息删除事件对应的模型对象 `Model.MessageDelete`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.MessageDelete], Awaitable[None]]",
+        ) -> "Callable[[Model.MessageDelete], Awaitable[None]]":
+            self._register_handler("DIRECT_MESSAGE_DELETE", func, Intent.DIRECT_MESSAGE)
+            return func
+
+        return decorator
+
+    @property
+    def on_guild_create(
+        self,
+    ) -> "Callable[[Callable[[Model.Guild], Awaitable[None]]], Callable[[Model.Guild], Awaitable[None]]]":
+        """
+        加入频道事件
+
+        事件类型: GUILD_CREATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收频道事件对应的模型对象 `Model.Guild`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Guild], Awaitable[None]]",
+        ) -> "Callable[[Model.Guild], Awaitable[None]]":
+            self._register_handler("GUILD_CREATE", func, Intent.GUILDS)
+            return func
+
+        return decorator
+
+    @property
+    def on_guild_update(
+        self,
+    ) -> "Callable[[Callable[[Model.Guild], Awaitable[None]]], Callable[[Model.Guild], Awaitable[None]]]":
+        """
+        频道更新事件
+
+        事件类型: GUILD_UPDATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收频道事件对应的模型对象 `Model.Guild`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Guild], Awaitable[None]]",
+        ) -> "Callable[[Model.Guild], Awaitable[None]]":
+            self._register_handler("GUILD_UPDATE", func, Intent.GUILDS)
+            return func
+
+        return decorator
+
+    @property
+    def on_guild_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.Guild], Awaitable[None]]], Callable[[Model.Guild], Awaitable[None]]]":
+        """
+        退出频道事件
+
+        事件类型: GUILD_DELETE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收频道事件对应的模型对象 `Model.Guild`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Guild], Awaitable[None]]",
+        ) -> "Callable[[Model.Guild], Awaitable[None]]":
+            self._register_handler("GUILD_DELETE", func, Intent.GUILDS)
+            return func
+
+        return decorator
+
+    @property
+    def on_channel_create(
+        self,
+    ) -> "Callable[[Callable[[Model.Channel], Awaitable[None]]], Callable[[Model.Channel], Awaitable[None]]]":
+        """
+        子频道创建事件
+
+        事件类型: CHANNEL_CREATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收子频道事件对应的模型对象 `Model.Channel`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Channel], Awaitable[None]]",
+        ) -> "Callable[[Model.Channel], Awaitable[None]]":
+            self._register_handler("CHANNEL_CREATE", func, Intent.GUILDS)
+            return func
+
+        return decorator
+
+    @property
+    def on_channel_update(
+        self,
+    ) -> "Callable[[Callable[[Model.Channel], Awaitable[None]]], Callable[[Model.Channel], Awaitable[None]]]":
+        """
+        子频道更新事件
+
+        事件类型: CHANNEL_UPDATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收子频道事件对应的模型对象 `Model.Channel`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Channel], Awaitable[None]]",
+        ) -> "Callable[[Model.Channel], Awaitable[None]]":
+            self._register_handler("CHANNEL_UPDATE", func, Intent.GUILDS)
+            return func
+
+        return decorator
+
+    @property
+    def on_channel_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.Channel], Awaitable[None]]], Callable[[Model.Channel], Awaitable[None]]]":
+        """
+        子频道删除事件
+
+        事件类型: CHANNEL_DELETE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收子频道事件对应的模型对象 `Model.Channel`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Channel], Awaitable[None]]",
+        ) -> "Callable[[Model.Channel], Awaitable[None]]":
+            self._register_handler("CHANNEL_DELETE", func, Intent.GUILDS)
+            return func
+
+        return decorator
+
+    @property
+    def on_guild_member_add(
+        self,
+    ) -> "Callable[[Callable[[Model.MemberWithGuildID], Awaitable[None]]], Callable[[Model.MemberWithGuildID], Awaitable[None]]]":
+        """
+        成员加入频道事件
+
+        事件类型: GUILD_MEMBER_ADD
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收成员事件对应的模型对象 `Model.MemberWithGuildID`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.MemberWithGuildID], Awaitable[None]]",
+        ) -> "Callable[[Model.MemberWithGuildID], Awaitable[None]]":
+            self._register_handler("GUILD_MEMBER_ADD", func, Intent.GUILD_MEMBERS)
+            return func
+
+        return decorator
+
+    @property
+    def on_guild_member_update(
+        self,
+    ) -> "Callable[[Callable[[Model.MemberWithGuildID], Awaitable[None]]], Callable[[Model.MemberWithGuildID], Awaitable[None]]]":
+        """
+        成员更新事件
+
+        事件类型: GUILD_MEMBER_UPDATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收成员事件对应的模型对象 `Model.MemberWithGuildID`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.MemberWithGuildID], Awaitable[None]]",
+        ) -> "Callable[[Model.MemberWithGuildID], Awaitable[None]]":
+            self._register_handler("GUILD_MEMBER_UPDATE", func, Intent.GUILD_MEMBERS)
+            return func
+
+        return decorator
+
+    @property
+    def on_guild_member_remove(
+        self,
+    ) -> "Callable[[Callable[[Model.MemberWithGuildID], Awaitable[None]]], Callable[[Model.MemberWithGuildID], Awaitable[None]]]":
+        """
+        成员退出频道事件
+
+        事件类型: GUILD_MEMBER_REMOVE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收成员事件对应的模型对象 `Model.MemberWithGuildID`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.MemberWithGuildID], Awaitable[None]]",
+        ) -> "Callable[[Model.MemberWithGuildID], Awaitable[None]]":
+            self._register_handler("GUILD_MEMBER_REMOVE", func, Intent.GUILD_MEMBERS)
+            return func
+
+        return decorator
+
+    @property
+    def on_group_add(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupEvent], Awaitable[None]]], Callable[[Model.GroupEvent], Awaitable[None]]]":
+        """
+        加入群聊事件
+
+        事件类型: GROUP_ADD_ROBOT
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收群聊事件对应的模型对象 `Model.GroupEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.GroupEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.GroupEvent], Awaitable[None]]":
+            self._register_handler("GROUP_ADD_ROBOT", func, Intent.GROUP_AND_C2C_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_group_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupEvent], Awaitable[None]]], Callable[[Model.GroupEvent], Awaitable[None]]]":
+        """
+        退出群聊事件
+
+        事件类型: GROUP_DEL_ROBOT
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收群聊事件对应的模型对象 `Model.GroupEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.GroupEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.GroupEvent], Awaitable[None]]":
+            self._register_handler("GROUP_DEL_ROBOT", func, Intent.GROUP_AND_C2C_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_group_msg_reject(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupEvent], Awaitable[None]]], Callable[[Model.GroupEvent], Awaitable[None]]]":
+        """
+        群聊拒绝消息事件
+
+        事件类型: GROUP_MSG_REJECT
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收群聊事件对应的模型对象 `Model.GroupEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.GroupEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.GroupEvent], Awaitable[None]]":
+            self._register_handler("GROUP_MSG_REJECT", func, Intent.GROUP_AND_C2C_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_group_msg_receive(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupEvent], Awaitable[None]]], Callable[[Model.GroupEvent], Awaitable[None]]]":
+        """
+        群聊接受消息事件
+
+        事件类型: GROUP_MSG_RECEIVE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收群聊事件对应的模型对象 `Model.GroupEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.GroupEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.GroupEvent], Awaitable[None]]":
+            self._register_handler(
+                "GROUP_MSG_RECEIVE", func, Intent.GROUP_AND_C2C_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_friend_add(
+        self,
+    ) -> "Callable[[Callable[[Model.FriendEvent], Awaitable[None]]], Callable[[Model.FriendEvent], Awaitable[None]]]":
+        """
+        添加好友事件
+
+        事件类型: FRIEND_ADD
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收好友事件对应的模型对象 `Model.FriendEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.FriendEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.FriendEvent], Awaitable[None]]":
+            self._register_handler("FRIEND_ADD", func, Intent.GROUP_AND_C2C_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_friend_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.FriendEvent], Awaitable[None]]], Callable[[Model.FriendEvent], Awaitable[None]]]":
+        """
+        删除好友事件
+
+        事件类型: FRIEND_DEL
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收好友事件对应的模型对象 `Model.FriendEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.FriendEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.FriendEvent], Awaitable[None]]":
+            self._register_handler("FRIEND_DEL", func, Intent.GROUP_AND_C2C_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_c2c_msg_reject(
+        self,
+    ) -> "Callable[[Callable[[Model.FriendEvent], Awaitable[None]]], Callable[[Model.FriendEvent], Awaitable[None]]]":
+        """
+        拒绝消息事件
+
+        事件类型: C2C_MSG_REJECT
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收好友事件对应的模型对象 `Model.FriendEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.FriendEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.FriendEvent], Awaitable[None]]":
+            self._register_handler("C2C_MSG_REJECT", func, Intent.GROUP_AND_C2C_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_c2c_msg_receive(
+        self,
+    ) -> "Callable[[Callable[[Model.FriendEvent], Awaitable[None]]], Callable[[Model.FriendEvent], Awaitable[None]]]":
+        """
+        接受消息事件
+
+        事件类型: C2C_MSG_RECEIVE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收好友事件对应的模型对象 `Model.FriendEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.FriendEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.FriendEvent], Awaitable[None]]":
+            self._register_handler("C2C_MSG_RECEIVE", func, Intent.GROUP_AND_C2C_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_message_audit_pass(
+        self,
+    ) -> "Callable[[Callable[[Model.MessageAudited], Awaitable[None]]], Callable[[Model.MessageAudited], Awaitable[None]]]":
+        """
+        消息审核通过事件
+
+        事件类型: MESSAGE_AUDIT_PASS
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收消息审核事件对应的模型对象 `Model.MessageAudited`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.MessageAudited], Awaitable[None]]",
+        ) -> "Callable[[Model.MessageAudited], Awaitable[None]]":
+            self._register_handler("MESSAGE_AUDIT_PASS", func, Intent.MESSAGE_AUDIT)
+            return func
+
+        return decorator
+
+    @property
+    def on_message_audit_reject(
+        self,
+    ) -> "Callable[[Callable[[Model.MessageAudited], Awaitable[None]]], Callable[[Model.MessageAudited], Awaitable[None]]]":
+        """
+        消息审核拒绝事件
+
+        事件类型: MESSAGE_AUDIT_REJECT
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收消息审核事件对应的模型对象 `Model.MessageAudited`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.MessageAudited], Awaitable[None]]",
+        ) -> "Callable[[Model.MessageAudited], Awaitable[None]]":
+            self._register_handler("MESSAGE_AUDIT_REJECT", func, Intent.MESSAGE_AUDIT)
+            return func
+
+        return decorator
+
+    @property
+    def on_reaction_add(
+        self,
+    ) -> "Callable[[Callable[[Model.MessageReaction], Awaitable[None]]], Callable[[Model.MessageReaction], Awaitable[None]]]":
+        """
+        表情表态添加事件
+
+        事件类型: MESSAGE_REACTION_ADD
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收表情表态事件对应的模型对象 `Model.MessageReaction`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.MessageReaction], Awaitable[None]]",
+        ) -> "Callable[[Model.MessageReaction], Awaitable[None]]":
+            self._register_handler(
+                "MESSAGE_REACTION_ADD", func, Intent.GUILD_MESSAGE_REACTIONS
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_reaction_remove(
+        self,
+    ) -> "Callable[[Callable[[Model.MessageReaction], Awaitable[None]]], Callable[[Model.MessageReaction], Awaitable[None]]]":
+        """
+        表情表态移除事件
+
+        事件类型: MESSAGE_REACTION_REMOVE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收表情表态事件对应的模型对象 `Model.MessageReaction`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.MessageReaction], Awaitable[None]]",
+        ) -> "Callable[[Model.MessageReaction], Awaitable[None]]":
+            self._register_handler(
+                "MESSAGE_REACTION_REMOVE", func, Intent.GUILD_MESSAGE_REACTIONS
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_interaction(
+        self,
+    ) -> "Callable[[Callable[[Model.Interaction], Awaitable[None]]], Callable[[Model.Interaction], Awaitable[None]]]":
+        """
+        互动按钮回调事件
+
+        事件类型: INTERACTION_CREATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收互动事件对应的模型对象 `Model.Interaction`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Interaction], Awaitable[None]]",
+        ) -> "Callable[[Model.Interaction], Awaitable[None]]":
+            self._register_handler("INTERACTION_CREATE", func, Intent.INTERACTION)
+            return func
+
+        return decorator
+
+    @property
+    def on_forum_thread_create(
+        self,
+    ) -> "Callable[[Callable[[Model.Thread], Awaitable[None]]], Callable[[Model.Thread], Awaitable[None]]]":
+        """
+        帖子创建事件
+
+        事件类型: FORUM_THREAD_CREATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收帖子事件对应的模型对象 `Model.Thread`。
+
+        注意: 仅私域机器人可用
+        """
+
+        def decorator(
+            func: "Callable[[Model.Thread], Awaitable[None]]",
+        ) -> "Callable[[Model.Thread], Awaitable[None]]":
+            if not self.is_private:
+                self.logger.warning(
+                    f"on_forum_thread_create 仅私域机器人可用，当前为公域机器人，"
+                    f"事件处理器 {func.__name__} 可能无法正常接收事件"
+                )
+            self._register_handler("FORUM_THREAD_CREATE", func, Intent.FORUMS_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_forum_thread_update(
+        self,
+    ) -> "Callable[[Callable[[Model.Thread], Awaitable[None]]], Callable[[Model.Thread], Awaitable[None]]]":
+        """
+        帖子更新事件
+
+        事件类型: FORUM_THREAD_UPDATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收帖子事件对应的模型对象 `Model.Thread`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Thread], Awaitable[None]]",
+        ) -> "Callable[[Model.Thread], Awaitable[None]]":
+            self._register_handler("FORUM_THREAD_UPDATE", func, Intent.FORUMS_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_forum_thread_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.Thread], Awaitable[None]]], Callable[[Model.Thread], Awaitable[None]]]":
+        """
+        帖子删除事件
+
+        事件类型: FORUM_THREAD_DELETE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收帖子事件对应的模型对象 `Model.Thread`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Thread], Awaitable[None]]",
+        ) -> "Callable[[Model.Thread], Awaitable[None]]":
+            self._register_handler("FORUM_THREAD_DELETE", func, Intent.FORUMS_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_forum_post_create(
+        self,
+    ) -> "Callable[[Callable[[Model.Post], Awaitable[None]]], Callable[[Model.Post], Awaitable[None]]]":
+        """
+        评论创建事件
+
+        事件类型: FORUM_POST_CREATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收评论事件对应的模型对象 `Model.Post`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Post], Awaitable[None]]",
+        ) -> "Callable[[Model.Post], Awaitable[None]]":
+            self._register_handler("FORUM_POST_CREATE", func, Intent.FORUMS_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_forum_post_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.Post], Awaitable[None]]], Callable[[Model.Post], Awaitable[None]]]":
+        """
+        评论删除事件
+
+        事件类型: FORUM_POST_DELETE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收评论事件对应的模型对象 `Model.Post`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Post], Awaitable[None]]",
+        ) -> "Callable[[Model.Post], Awaitable[None]]":
+            self._register_handler("FORUM_POST_DELETE", func, Intent.FORUMS_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_forum_reply_create(
+        self,
+    ) -> "Callable[[Callable[[Model.Reply], Awaitable[None]]], Callable[[Model.Reply], Awaitable[None]]]":
+        """
+        回复创建事件
+
+        事件类型: FORUM_REPLY_CREATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收回复事件对应的模型对象 `Model.Reply`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Reply], Awaitable[None]]",
+        ) -> "Callable[[Model.Reply], Awaitable[None]]":
+            self._register_handler("FORUM_REPLY_CREATE", func, Intent.FORUMS_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_forum_reply_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.Reply], Awaitable[None]]], Callable[[Model.Reply], Awaitable[None]]]":
+        """
+        回复删除事件
+
+        事件类型: FORUM_REPLY_DELETE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收回复事件对应的模型对象 `Model.Reply`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.Reply], Awaitable[None]]",
+        ) -> "Callable[[Model.Reply], Awaitable[None]]":
+            self._register_handler("FORUM_REPLY_DELETE", func, Intent.FORUMS_EVENT)
+            return func
+
+        return decorator
+
+    @property
+    def on_forum_publish_audit_result(
+        self,
+    ) -> "Callable[[Callable[[Model.AuditResult], Awaitable[None]]], Callable[[Model.AuditResult], Awaitable[None]]]":
+        """
+        论坛帖子审核结果事件
+
+        事件类型: FORUM_PUBLISH_AUDIT_RESULT
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收审核结果事件对应的模型对象 `Model.AuditResult`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.AuditResult], Awaitable[None]]",
+        ) -> "Callable[[Model.AuditResult], Awaitable[None]]":
+            self._register_handler(
+                "FORUM_PUBLISH_AUDIT_RESULT", func, Intent.FORUMS_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_open_forum_thread_create(
+        self,
+    ) -> "Callable[[Callable[[Model.OpenForumEvent], Awaitable[None]]], Callable[[Model.OpenForumEvent], Awaitable[None]]]":
+        """
+        开放论坛主题创建事件
+
+        事件类型: OPEN_FORUM_THREAD_CREATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收开放论坛事件对应的模型对象 `Model.OpenForumEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.OpenForumEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.OpenForumEvent], Awaitable[None]]":
+            self._register_handler(
+                "OPEN_FORUM_THREAD_CREATE", func, Intent.OPEN_FORUM_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_open_forum_thread_update(
+        self,
+    ) -> "Callable[[Callable[[Model.OpenForumEvent], Awaitable[None]]], Callable[[Model.OpenForumEvent], Awaitable[None]]]":
+        """
+        开放论坛主题更新事件
+
+        事件类型: OPEN_FORUM_THREAD_UPDATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收开放论坛事件对应的模型对象 `Model.OpenForumEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.OpenForumEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.OpenForumEvent], Awaitable[None]]":
+            self._register_handler(
+                "OPEN_FORUM_THREAD_UPDATE", func, Intent.OPEN_FORUM_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_open_forum_thread_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.OpenForumEvent], Awaitable[None]]], Callable[[Model.OpenForumEvent], Awaitable[None]]]":
+        """
+        开放论坛主题删除事件
+
+        事件类型: OPEN_FORUM_THREAD_DELETE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收开放论坛事件对应的模型对象 `Model.OpenForumEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.OpenForumEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.OpenForumEvent], Awaitable[None]]":
+            self._register_handler(
+                "OPEN_FORUM_THREAD_DELETE", func, Intent.OPEN_FORUM_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_open_forum_post_create(
+        self,
+    ) -> "Callable[[Callable[[Model.OpenForumEvent], Awaitable[None]]], Callable[[Model.OpenForumEvent], Awaitable[None]]]":
+        """
+        开放论坛帖子创建事件
+
+        事件类型: OPEN_FORUM_POST_CREATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收开放论坛事件对应的模型对象 `Model.OpenForumEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.OpenForumEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.OpenForumEvent], Awaitable[None]]":
+            self._register_handler(
+                "OPEN_FORUM_POST_CREATE", func, Intent.OPEN_FORUM_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_open_forum_post_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.OpenForumEvent], Awaitable[None]]], Callable[[Model.OpenForumEvent], Awaitable[None]]]":
+        """
+        开放论坛帖子删除事件
+
+        事件类型: OPEN_FORUM_POST_DELETE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收开放论坛事件对应的模型对象 `Model.OpenForumEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.OpenForumEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.OpenForumEvent], Awaitable[None]]":
+            self._register_handler(
+                "OPEN_FORUM_POST_DELETE", func, Intent.OPEN_FORUM_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_open_forum_reply_create(
+        self,
+    ) -> "Callable[[Callable[[Model.OpenForumEvent], Awaitable[None]]], Callable[[Model.OpenForumEvent], Awaitable[None]]]":
+        """
+        开放论坛回复创建事件
+
+        事件类型: OPEN_FORUM_REPLY_CREATE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收开放论坛事件对应的模型对象 `Model.OpenForumEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.OpenForumEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.OpenForumEvent], Awaitable[None]]":
+            self._register_handler(
+                "OPEN_FORUM_REPLY_CREATE", func, Intent.OPEN_FORUM_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_open_forum_reply_delete(
+        self,
+    ) -> "Callable[[Callable[[Model.OpenForumEvent], Awaitable[None]]], Callable[[Model.OpenForumEvent], Awaitable[None]]]":
+        """
+        开放论坛回复删除事件
+
+        事件类型: OPEN_FORUM_REPLY_DELETE
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收开放论坛事件对应的模型对象 `Model.OpenForumEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.OpenForumEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.OpenForumEvent], Awaitable[None]]":
+            self._register_handler(
+                "OPEN_FORUM_REPLY_DELETE", func, Intent.OPEN_FORUM_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_audio_or_live_channel_member_enter(
+        self,
+    ) -> "Callable[[Callable[[Model.LiveChannelMember], Awaitable[None]]], Callable[[Model.LiveChannelMember], Awaitable[None]]]":
+        """
+        进入音视频/直播子频道事件
+
+        事件类型: AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收音视频子频道成员事件对应的模型对象
+            `Model.LiveChannelMember`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.LiveChannelMember], Awaitable[None]]",
+        ) -> "Callable[[Model.LiveChannelMember], Awaitable[None]]":
+            self._register_handler(
+                "AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER", func, Intent.AUDIO_ACTION
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_audio_or_live_channel_member_exit(
+        self,
+    ) -> "Callable[[Callable[[Model.LiveChannelMember], Awaitable[None]]], Callable[[Model.LiveChannelMember], Awaitable[None]]]":
+        """
+        离开音视频/直播子频道事件
+
+        事件类型: AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收音视频子频道成员事件对应的模型对象
+            `Model.LiveChannelMember`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.LiveChannelMember], Awaitable[None]]",
+        ) -> "Callable[[Model.LiveChannelMember], Awaitable[None]]":
+            self._register_handler(
+                "AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT", func, Intent.AUDIO_ACTION
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_audio_start(
+        self,
+    ) -> "Callable[[Callable[[Model.AudioAction], Awaitable[None]]], Callable[[Model.AudioAction], Awaitable[None]]]":
+        """
+        音频开始播放事件
+
+        事件类型: AUDIO_START
+        Intent: AUDIO_ACTION (1<<29)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收音频事件对应的模型对象 `Model.AudioAction`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.AudioAction], Awaitable[None]]",
+        ) -> "Callable[[Model.AudioAction], Awaitable[None]]":
+            self._register_handler("AUDIO_START", func, Intent.AUDIO_ACTION)
+            return func
+
+        return decorator
+
+    @property
+    def on_audio_finish(
+        self,
+    ) -> "Callable[[Callable[[Model.AudioAction], Awaitable[None]]], Callable[[Model.AudioAction], Awaitable[None]]]":
+        """
+        音频播放结束事件
+
+        事件类型: AUDIO_FINISH
+        Intent: AUDIO_ACTION (1<<29)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收音频事件对应的模型对象 `Model.AudioAction`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.AudioAction], Awaitable[None]]",
+        ) -> "Callable[[Model.AudioAction], Awaitable[None]]":
+            self._register_handler("AUDIO_FINISH", func, Intent.AUDIO_ACTION)
+            return func
+
+        return decorator
+
+    @property
+    def on_audio_on_mic(
+        self,
+    ) -> "Callable[[Callable[[Model.AudioAction], Awaitable[None]]], Callable[[Model.AudioAction], Awaitable[None]]]":
+        """
+        上麦事件
+
+        事件类型: AUDIO_ON_MIC
+        Intent: AUDIO_ACTION (1<<29)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收音频事件对应的模型对象 `Model.AudioAction`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.AudioAction], Awaitable[None]]",
+        ) -> "Callable[[Model.AudioAction], Awaitable[None]]":
+            self._register_handler("AUDIO_ON_MIC", func, Intent.AUDIO_ACTION)
+            return func
+
+        return decorator
+
+    @property
+    def on_audio_off_mic(
+        self,
+    ) -> "Callable[[Callable[[Model.AudioAction], Awaitable[None]]], Callable[[Model.AudioAction], Awaitable[None]]]":
+        """
+        下麦事件
+
+        事件类型: AUDIO_OFF_MIC
+        Intent: AUDIO_ACTION (1<<29)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收音频事件对应的模型对象 `Model.AudioAction`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.AudioAction], Awaitable[None]]",
+        ) -> "Callable[[Model.AudioAction], Awaitable[None]]":
+            self._register_handler("AUDIO_OFF_MIC", func, Intent.AUDIO_ACTION)
+            return func
+
+        return decorator
+
+    @property
+    def on_all_intent_events(
+        self,
+    ) -> "Callable[[Callable[[Model.BaseModel], Awaitable[None]]], Callable[[Model.BaseModel], Awaitable[None]]]":
+        """
+        订阅所有机器人事件
+
+        包含以下 Intent 的所有事件：
+        - GUILDS (频道相关)
+        - GUILD_MEMBERS (成员相关)
+        - GUILD_MESSAGES (消息相关，私域)
+        - GUILD_MESSAGE_REACTIONS (表情表态)
+        - DIRECT_MESSAGE (私信)
+        - MESSAGE_AUDIT (消息审核)
+        - FORUMS_EVENT (论坛事件，私域)
+        - AUDIO_ACTION (音频操作)
+        - PUBLIC_GUILD_MESSAGES (公域消息)
+        - INTERACTION (互动按钮)
+        - GROUP_AND_C2C_EVENT (群聊和单聊)
+        - OPEN_FORUM_EVENT (开放论坛)
+
+        注意: 部分事件需要私域机器人权限才能接收
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收事件对应的模型对象进行处理。该参数类型应为
+            `Model.BaseModel`，实际运行时可能为不同的具体模型子类。
+
+        示例:
+            @bot.on_all_intent_events
+            async def handle_all_intent_events(event: Model.BaseModel):
+                print(f"收到事件: {event}")
+        """
+
+        def decorator(
+            func: "Callable[[Model.BaseModel], Awaitable[None]]",
+        ) -> "Callable[[Model.BaseModel], Awaitable[None]]":
+            event_types = get_event_types_by_intent(Intent.ALL_INTENT_EVENT)
+            for event_type in event_types:
+                self._register_handler(event_type, func, EVENT_INTENT_MAP[event_type])
+            return func
+
+        return decorator
+
+    @property
+    def on_default_public_events(
+        self,
+    ) -> "Callable[[Callable[[Model.BaseModel], Awaitable[None]]], Callable[[Model.BaseModel], Awaitable[None]]]":
+        """
+        订阅公域机器人默认事件
+
+        包含以下 Intent 的事件：
+        - GUILDS (频道相关)
+        - PUBLIC_GUILD_MESSAGES (公域消息，@机器人)
+        - GROUP_AND_C2C_EVENT (群聊和单聊)
+        - OPEN_FORUM_EVENT (开放论坛)
+
+        适用于大多数公域机器人场景。
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收事件对应的模型对象进行处理。该参数类型应为
+            `Model.BaseModel`，实际运行时可能为不同的具体模型子类。
+
+        示例:
+            @bot.on_default_public_events
+            async def handle_default_events(event: Model.BaseModel):
+                print(f"收到事件: {event}")
+        """
+
+        def decorator(
+            func: "Callable[[Model.BaseModel], Awaitable[None]]",
+        ) -> "Callable[[Model.BaseModel], Awaitable[None]]":
+            event_types = get_event_types_by_intent(Intent.DEFAULT_PUBLIC)
+            for event_type in event_types:
+                self._register_handler(event_type, func, EVENT_INTENT_MAP[event_type])
+            return func
+
+        return decorator
+
+    @property
+    def on_default_private_events(
+        self,
+    ) -> "Callable[[Callable[[Model.BaseModel], Awaitable[None]]], Callable[[Model.BaseModel], Awaitable[None]]]":
+        """
+        订阅私域机器人默认事件
+
+        包含以下 Intent 的事件：
+        - GUILDS (频道相关)
+        - GUILD_MEMBERS (成员相关)
+        - GUILD_MESSAGES (全量消息)
+        - GUILD_MESSAGE_REACTIONS (表情表态)
+        - DIRECT_MESSAGE (私信)
+        - MESSAGE_AUDIT (消息审核)
+        - INTERACTION (互动按钮)
+        - GROUP_AND_C2C_EVENT (群聊和单聊)
+
+        适用于私域机器人场景。
+
+        注意: 仅私域机器人可用
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收事件对应的模型对象进行处理。该参数类型应为
+            `Model.BaseModel`，实际运行时可能为不同的具体模型子类。
+
+        示例:
+            @bot.on_default_private_events
+            async def handle_private_events(event: Model.BaseModel):
+                print(f"收到事件: {event}")
+        """
+
+        def decorator(
+            func: "Callable[[Model.BaseModel], Awaitable[None]]",
+        ) -> "Callable[[Model.BaseModel], Awaitable[None]]":
+            if not self.is_private:
+                self.logger.warning(
+                    f"on_default_private_events 仅私域机器人可用，当前为公域机器人，"
+                    f"事件处理器 {func.__name__} 可能无法正常接收部分事件"
+                )
+            event_types = get_event_types_by_intent(Intent.DEFAULT_PRIVATE)
+            for event_type in event_types:
+                self._register_handler(event_type, func, EVENT_INTENT_MAP[event_type])
+            return func
+
+        return decorator
+
+    def on_startup(
+        self,
+        func: "Callable[[Model.StartupEvent], Awaitable[None]]",
+    ) -> "Callable[[Model.StartupEvent], Awaitable[None]]":
+        """
+        注册机器人启动事件处理器
+
+        当机器人成功连接并准备好后触发。
+
+        Args:
+            func: 异步处理函数。该回调函数应包含一个参数，
+                用于接收生命周期事件对象 `Model.StartupEvent`
+
+        Returns:
+            原函数
+
+        示例:
+            @bot.on_startup
+            async def handle_startup(event: Model.StartupEvent):
+                print(f"机器人启动成功，时间: {event.timestamp}")
+        """
+        self._lifecycle.register_startup(func)
+        return func
+
+    def on_shutdown(
+        self,
+        func: "Callable[[Model.ShutdownEvent], Awaitable[None]]",
+    ) -> "Callable[[Model.ShutdownEvent], Awaitable[None]]":
+        """
+        注册机器人关闭事件处理器
+
+        当机器人即将关闭时触发。
+
+        Args:
+            func: 异步处理函数。该回调函数应包含一个参数，
+                用于接收生命周期事件对象 `Model.ShutdownEvent`
+
+        Returns:
+            原函数
+
+        示例:
+            @bot.on_shutdown
+            async def handle_shutdown(event: Model.ShutdownEvent):
+                print(f"机器人正在关闭，时间: {event.timestamp}")
+        """
+        self._lifecycle.register_shutdown(func)
+        return func
+
+    def _build_module_name_from_path(
+        self, plugin_file: Path, plugins_path: Path
+    ) -> str:
+        """
+        根据插件文件路径构建模块名
+
+        Args:
+            plugin_file: 插件文件路径
+            plugins_path: 插件根目录路径
+
+        Returns:
+            模块名（支持子目录结构）
+        """
+        rel_path = plugin_file.relative_to(plugins_path)
+        parts = list(rel_path.parts)
+        if len(parts) > 1:
+            return ".".join(parts[:-1] + [plugin_file.stem])
+        else:
+            return plugin_file.stem
+
+    def _load_plugins_from_dir(self) -> list[tuple[str, bool, str | None]]:
+        """
+        内部方法：从插件目录扫描并导入所有插件模块
+
+        统一的插件加载入口，被 _preload_plugins_for_intents 和 load_plugins 共同调用。
+        负责目录扫描、sys.path 管理、模块导入、sys.modules 注册、错误隔离。
+
+        Returns:
+            列表，每项为 (module_name: str, success: bool, error: str | None)
+        """
+        plugins_path = Path(self.plugins_dir)
+        if not plugins_path.exists():
+            return []
+
+        if not plugins_path.is_dir():
+            return []
+
+        plugins_dir_str = str(plugins_path.absolute())
+        if plugins_dir_str not in sys.path:
+            sys.path.insert(0, plugins_dir_str)
+            self._plugins_path_added_to_syspath = True
+
+        pattern = "**/*.py" if self.plugins_recursive else "*.py"
+        plugin_files = list(plugins_path.glob(pattern))
+
+        results = []
+        for plugin_file in plugin_files:
+            if plugin_file.name.startswith("_") or plugin_file.name == "__init__.py":
+                continue
+
+            try:
+                module_name = self._build_module_name_from_path(
+                    plugin_file, plugins_path
+                )
+
+                if module_name in Plugins._module_paths:
+                    results.append((module_name, True, "already_loaded"))
+                    continue
+
+                spec = importlib.util.spec_from_file_location(module_name, plugin_file)
+                if not spec or not spec.loader:
+                    results.append((module_name, False, "无法创建模块规格"))
+                    continue
+
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                Plugins._current_loading_module = module_name
+                try:
+                    spec.loader.exec_module(module)
+                    Plugins._module_paths[module_name] = plugin_file.resolve()
+
+                    if hasattr(module, "on_plugin_load"):
+                        hook = getattr(module, "on_plugin_load")
+                        if asyncio.iscoroutinefunction(hook):
+                            self._pending_load_hooks.append(hook)
+                        else:
+                            try:
+                                hook(self)
+                            except Exception as e:
+                                self.logger.warning(
+                                    f"插件 {module_name} 的 on_plugin_load 钩子执行失败: {e}"
+                                )
+
+                    results.append((module_name, True, None))
+                finally:
+                    Plugins._current_loading_module = None
+
+            except Exception as e:
+                Plugins._current_loading_module = None
+                results.append((plugin_file.stem, False, str(e)))
+
+        return results
+
+    def _preload_plugins_for_intents(self) -> None:
+        """
+        预加载插件以注册必要的Intent（初始化阶段调用）
+
+        在 __init__ 中执行，用于注册插件中定义的 Intent，
+        确保在 WebSocket Identify 前完成 Intent 计算。
+        """
+        results = self._load_plugins_from_dir()
+
+        for module_name, success, error in results:
+            if success and error == "already_loaded":
+                self.logger.debug(f"插件已加载，跳过: {module_name}")
+            elif success:
+                self.logger.info(f"预加载插件成功: {module_name}")
+            elif error:
+                self.logger.error(f"预加载插件 {module_name} 失败: {error}")
+
+        self._register_plugin_intents()
+
+    def load_plugins(self) -> None:
+        """
+        手动加载插件目录中的插件
+
+        当 auto_load_plugins=False 时，可调用此方法手动触发加载。
+        当 auto_load_plugins=True 时，插件已在初始化时通过 _preload_plugins_for_intents 自动加载，
+        再次调用此方法不会重复加载已有插件（去重保护），仅加载新增的插件文件。
+
+        扫描插件目录，加载尚未注册的 Python 模块，自动注册通过装饰器定义的命令和预处理器。
+        已加载的插件会被安全跳过，不会产生重复注册。
+        """
+        results = self._load_plugins_from_dir()
+
+        loaded_count = 0
+        for module_name, success, error in results:
+            if success and error == "already_loaded":
+                self.logger.debug(f"插件已加载，跳过: {module_name}")
+            elif success:
+                commands_before = len(Plugins._commands)
+                preprocessors_before = sum(
+                    len(v) for v in Plugins._preprocessors.values()
+                )
+                has_new_commands = len(Plugins._commands) > commands_before
+                has_new_preprocessors = (
+                    sum(len(v) for v in Plugins._preprocessors.values())
+                    > preprocessors_before
+                )
+
+                if has_new_commands or has_new_preprocessors:
+                    loaded_count += 1
+                    self.logger.info(f"成功加载插件: {module_name}")
+                else:
+                    self.logger.debug(
+                        f"插件 {module_name} 未使用装饰器注册命令或预处理器"
+                    )
+            elif error:
+                self.logger.error(f"加载插件 {module_name} 失败: {error}")
+
+        if loaded_count > 0:
+            self._register_plugin_intents()
+            self._log_registered_plugins()
+        else:
+            self.logger.info("没有找到新的可加载插件")
+
+    def _log_registered_plugins(self) -> None:
+        preprocessor_count = sum(len(v) for v in Plugins._preprocessors.values())
+        for intents, v in Plugins._preprocessors.items():
+            scope = CommandValidScenes.get_name(intents)
+            for func in v:
+                self.logger.info(f"从Plugins注册 {scope} 预处理器：{func.__name__}")
+
+        enabled_commands = [cmd for cmd in Plugins._commands if cmd.enabled]
+        for cmd in enabled_commands:
+            if cmd.command:
+                cmd_names = ", ".join(cmd.command)
+                self.logger.info(f"从Plugins注册指令：[{cmd_names}]")
+            elif cmd.regex:
+                regex_patterns = [r.pattern for r in cmd.regex]
+                self.logger.info(
+                    f"从Plugins注册正则指令：[{', '.join(regex_patterns)}]"
+                )
+            else:
+                self.logger.info(f"从Plugins注册指令")
+
+        command_count = len(enabled_commands)
+        if command_count or preprocessor_count > 0:
+            self.logger.info(
+                f"插件注册完成：{command_count} 个指令，{preprocessor_count} 个预处理器"
+            )
+
+    def reload_plugin(self, plugin_name_or_command: str) -> "PluginReloadResult":
+        """
+        热重载指定插件
+
+        自动识别参数类型：
+        - 先尝试作为插件文件名
+        - 找不到则尝试作为命令名
+
+        热重载流程会自动触发插件的 on_plugin_unload 和 on_plugin_load 钩子。
+
+        Args:
+            plugin_name_or_command: 插件名或命令名
+
+        Returns:
+            重载结果信息
+        """
+        plugin_name = Plugins._find_module_by_name(plugin_name_or_command)
+
+        if plugin_name and plugin_name in Plugins._module_paths:
+            try:
+                module = sys.modules.get(plugin_name)
+                if module and hasattr(module, "on_plugin_unload"):
+                    hook = getattr(module, "on_plugin_unload")
+                    if asyncio.iscoroutinefunction(hook):
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            loop.create_task(hook(self))
+                        else:
+                            loop.run_until_complete(hook(self))
+                    else:
+                        hook(self)
+            except Exception as e:
+                self.logger.warning(
+                    f"插件 {plugin_name} 的 on_plugin_unload 钩子执行失败: {e}"
+                )
+
+        result = Plugins.reload_plugin(plugin_name_or_command, self.plugins_dir)
+
+        if result["success"]:
+            module_name = result["module"]
+            try:
+                module = sys.modules.get(module_name)
+                if module and hasattr(module, "on_plugin_load"):
+                    hook = getattr(module, "on_plugin_load")
+                    if asyncio.iscoroutinefunction(hook):
+                        self._pending_load_hooks.append(hook)
+                    else:
+                        hook(self)
+            except Exception as e:
+                self.logger.warning(
+                    f"插件 {module_name} 的 on_plugin_load 钩子执行失败: {e}"
+                )
+
+            self.logger.info(
+                f"插件 {result['module']} 热重载成功: "
+                f"卸载 {result['unloaded']['commands']} 命令, "
+                f"加载 {result['loaded']['commands']} 命令"
+            )
+        else:
+            self.logger.error(f"热重载失败: {result['error']}")
+
+        return result
+
+    def reload_all_plugins(self) -> list["PluginReloadResult"]:
+        """
+        热重载所有插件
+
+        依次对每个已加载插件调用 reload_plugin，
+        会自动触发每个插件的 on_plugin_unload 和 on_plugin_load 钩子。
+
+        Returns:
+            所有插件的重载结果列表
+        """
+        results = []
+        plugins = Plugins.get_loaded_plugins()
+
+        for plugin in plugins:
+            short_name = plugin.split(".")[-1] if "." in plugin else plugin
+            result = self.reload_plugin(short_name)
+            results.append(result)
+
+            if result["success"]:
+                self.logger.info(f"插件 {result['module']} 热重载成功")
+            else:
+                self.logger.error(
+                    f"插件 {result['module']} 热重载失败: {result['error']}"
+                )
+
+        return results
+
+    def unload_plugin(self, plugin_name: str) -> "PluginStats":
+        """
+        卸载指定插件
+
+        Args:
+            plugin_name: 插件模块名（不含 .py 后缀）
+
+        Returns:
+            卸载的命令和预处理器数量
+        """
+        module_path = Plugins._module_paths.get(plugin_name)
+        if module_path:
+            try:
+                module = sys.modules.get(plugin_name)
+                if module and hasattr(module, "on_plugin_unload"):
+                    hook = getattr(module, "on_plugin_unload")
+                    if asyncio.iscoroutinefunction(hook):
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            loop.create_task(hook(self))
+                        else:
+                            loop.run_until_complete(hook(self))
+                    else:
+                        hook(self)
+            except Exception as e:
+                self.logger.warning(
+                    f"插件 {plugin_name} 的 on_plugin_unload 钩子执行失败: {e}"
+                )
+
+        result = Plugins.unload_plugin(plugin_name)
+        self.logger.info(
+            f"插件 {plugin_name} 已卸载: "
+            f"{result['commands']} 命令, {result['preprocessors']} 预处理器"
+        )
+        return result
+
+    def get_loaded_plugins(self) -> list[str]:
+        """
+        获取所有已加载的插件模块名
+
+        Returns:
+            插件模块名列表
+        """
+        return Plugins.get_loaded_plugins()
+
+    def get_all_commands(self) -> list["BotCommandObject"]:
+        """
+        获取所有已注册的命令对象（包括禁用的）
+
+        Returns:
+            命令对象列表
+        """
+        return Plugins.get_all_commands()
+
+    def find_command(self, func_name: str) -> "BotCommandObject | None":
+        """
+        根据函数名或命令名查找命令对象
+
+        Args:
+            func_name: 命令函数的名称，或命令文本（支持自动去除 / 前缀）
+
+        Returns:
+            命令对象，未找到返回 None
+        """
+        return Plugins.find_command(func_name)
+
+    def enable_command(self, func_name: str) -> bool:
+        """
+        启用指定的命令
+
+        Args:
+            func_name: 命令函数的名称，或命令文本
+
+        Returns:
+            是否成功启用
+        """
+        result = Plugins.enable_command(func_name)
+        if result:
+            self.logger.info(f"命令 {func_name} 已启用")
+        else:
+            self.logger.warning(f"启用命令 {func_name} 失败：命令不存在")
+        return result
+
+    def disable_command(self, func_name: str) -> bool:
+        """
+        禁用指定的命令
+
+        Args:
+            func_name: 命令函数的名称，或命令文本
+
+        Returns:
+            是否成功禁用
+        """
+        result = Plugins.disable_command(func_name)
+        if result:
+            self.logger.info(f"命令 {func_name} 已禁用")
+        else:
+            self.logger.warning(f"禁用命令 {func_name} 失败：命令不存在")
+        return result
+
+    def is_command_enabled(self, func_name: str) -> bool | None:
+        """
+        检查指定的命令是否启用
+
+        Args:
+            func_name: 命令函数的名称，或命令文本
+
+        Returns:
+            是否启用，未找到返回 None
+        """
+        return Plugins.is_command_enabled(func_name)
+
+    def remove_command(self, func_name: str) -> bool:
+        """
+        移除指定的命令
+
+        Args:
+            func_name: 命令函数的名称，或命令文本
+
+        Returns:
+            是否成功移除
+        """
+        result = Plugins.remove_command(func_name)
+        if result:
+            self.logger.info(f"命令 {func_name} 已移除")
+        else:
+            self.logger.warning(f"移除命令 {func_name} 失败：命令不存在")
+        return result
+
+    def get_plugin_commands(self, plugin_name: str) -> list[str]:
+        """
+        获取指定插件注册的所有命令函数名
+
+        Args:
+            plugin_name: 插件模块名
+
+        Returns:
+            命令函数名列表
+        """
+        return Plugins.get_plugin_commands(plugin_name)
+
+    def get_plugin_preprocessors(self, plugin_name: str) -> list[str]:
+        """
+        获取指定插件注册的所有预处理器函数名
+
+        Args:
+            plugin_name: 插件模块名
+
+        Returns:
+            预处理器函数名列表
+        """
+        return Plugins.get_plugin_preprocessors(plugin_name)
+
+    def clear_all_plugins(self) -> "PluginStats":
+        """
+        清空所有已注册的命令和预处理器
+
+        Returns:
+            清空的命令和预处理器数量
+        """
+        result = Plugins.clear_all_plugins()
+        self.logger.info(
+            f"已清空所有插件: {result['commands']} 命令, {result['preprocessors']} 预处理器"
+        )
+        return result
+
+    def _register_plugin_intents(self) -> None:
+        for cmd in Plugins._commands:
+            self._update_intents_for_scenes(cmd.valid_scenes)
+        for scene_bit, preprocessors in Plugins._preprocessors.items():
+            if preprocessors:
+                self._update_intents_for_scenes(CommandValidScenes(scene_bit))
+
+    async def _trigger_startup(self) -> None:
+        """
+        触发启动事件（内部方法）
+
+        由协议客户端在成功连接后调用。
+        """
+        self._log_registered_plugins()
+
+        for hook in self._pending_load_hooks:
+            try:
+                await hook(self)
+            except Exception as e:
+                self.logger.error(f"插件 on_plugin_load 异步钩子执行失败: {e}")
+        self._pending_load_hooks.clear()
+
+        await self._initialize_bot_info()
+        await self._lifecycle.trigger_startup()
+        self._lifecycle.start_timer()
+        self.logger.info("机器人已成功启动，进入运行状态")
+
+    async def _initialize_bot_info(self) -> None:
+        """初始化机器人信息"""
+        try:
+            bot_info = await self.api.get_me()
+            if bot_info and bot_info.id:
+                self._bot_id = bot_info.id
+                self._bot_name = bot_info.username
+                self.logger.info(
+                    f"机器人ID: {self._bot_id}，机器人名称: {self._bot_name}"
+                )
+        except Exception as e:
+            self.logger.warning(f"获取机器人信息失败: {e}")
+
+    def on_timer(
+        self,
+        interval: float,
+    ) -> "Callable[[Callable[[Model.TimerEvent], Awaitable[None]]], Callable[[Model.TimerEvent], Awaitable[None]]]":
+        """
+        注册周期定时器事件处理器
+
+        按指定间隔周期性触发。
+
+        Args:
+            interval: 定时间隔（秒）
+
+        Returns:
+            装饰器函数
+
+        示例:
+            @bot.on_timer(interval=60)
+            async def handle_timer(event: Model.TimerEvent):
+                print(f"定时器触发，第 {event.tick_count} 次")
+        """
+
+        def decorator(
+            func: "Callable[[Model.TimerEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.TimerEvent], Awaitable[None]]":
+            self._lifecycle.register_timer(func, interval)
+            return func
+
+        return decorator
+
+    @property
+    def bot_admin_manager(self) -> BotAdminManager:
+        """获取机器人管理员管理器"""
+        return self._bot_admin_manager
+
+    @property
+    def bot_id(self) -> str | None:
+        """获取机器人ID"""
+        return self._bot_id
+
+    @property
+    def session(self) -> SessionManager:
+        """获取会话管理器"""
+        return self._session_manager
+
+    def before_command(
+        self,
+        valid_scenes: CommandValidScenes = CommandValidScenes.ALL,
+    ):
+        """
+        注册预处理器，将在检查所有commands前执行
+
+        :param valid_scenes: 此处理器的有效场景，可传入多个场景，默认 CommandValidScenes.ALL
+
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收命令触发场景对应的消息模型对象。
+            具体类型由 valid_scenes 决定：
+            - CommandValidScenes.GUILD -> Model.GuildMessage
+            - CommandValidScenes.GROUP -> Model.GroupMessage
+            - CommandValidScenes.C2C -> Model.C2CMessage
+            - CommandValidScenes.DM -> Model.DirectMessage
+            - 多场景组合 -> 上述类型的联合类型
+        """
+
+        def wrap(func: Callable):
+            Plugins.before_command(valid_scenes, _module_name="__main__")(func)
+            return func
+
+        return wrap
+
+    def on_command(
+        self,
+        command: Iterable[str] | str | None = None,
+        regex: Pattern | str | Iterable[Pattern | str] | None = None,
+        is_treat: bool = True,
+        is_require_at: bool = False,
+        is_short_circuit: bool = True,
+        is_custom_short_circuit: bool = False,
+        is_require_admin: bool = False,
+        admin_error_msg: str | None = None,
+        valid_scenes: CommandValidScenes = CommandValidScenes.ALL,
+        enabled: bool = True,
+        is_require_bot_admin: bool = False,
+        bot_admin_error_msg: str | None = None,
+    ):
+        """
+        指令装饰器。用于快速注册消息事件
+
+        :param command: 可触发事件的指令列表，与正则regex互斥，优先使用此项
+        :param regex: 可触发指令的正则compile实例、正则表达式或它们的可迭代对象，与指令表互斥
+        :param is_treat: 是否在treated_msg中同时处理指令，如正则将返回.groups()，默认是
+        :param is_require_at: 是否要求必须艾特机器人才能触发指令，默认否
+        :param is_short_circuit: 如果触发指令成功是否短路不运行后续指令（将根据注册顺序排序指令的短路机制），默认是
+        :param is_custom_short_circuit: 如果触发指令成功而回调函数返回True则不运行后续指令，存在时优先于is_short_circuit，默认否
+        :param is_require_admin: 是否要求频道主或或管理才可触发指令，默认否 (在群聊和单聊中不生效，可使用全局机器人管理员控制)
+        :param admin_error_msg: 当is_require_admin为True，而触发用户的权限不足时，如此项不为None，返回此消息并短路；否则不进行短路
+        :param valid_scenes: 此机器人命令的有效场景，可传入多个场景，默认 CommandValidScenes.ALL
+        :param enabled: 是否启用此指令，默认True
+        :param is_require_bot_admin: 是否要求机器人管理员才可触发指令，默认否
+        :param bot_admin_error_msg: 当is_require_bot_admin为True，而触发用户的权限不足时，如此项不为None，返回此消息并短路；否则不进行短路
+
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收命令触发场景对应的消息模型对象。
+            具体类型由 valid_scenes 决定：
+            - CommandValidScenes.GUILD -> Model.GuildMessage
+            - CommandValidScenes.GROUP -> Model.GroupMessage
+            - CommandValidScenes.C2C -> Model.C2CMessage
+            - CommandValidScenes.DM -> Model.DirectMessage
+            - 多场景组合 -> 上述类型的联合类型
+        """
+
+        def wrap(func: Callable):
+            Plugins.on_command(
+                command,
+                regex,
+                is_treat,
+                is_require_at,
+                is_short_circuit,
+                is_custom_short_circuit,
+                is_require_admin,
+                admin_error_msg,
+                valid_scenes,
+                enabled,
+                is_require_bot_admin,
+                bot_admin_error_msg,
+                _module_name="__main__",
+            )(func)
+            self._update_intents_for_scenes(valid_scenes)
+            return func
+
+        return wrap
+
+    def _update_intents_for_scenes(self, valid_scenes: CommandValidScenes) -> None:
+        """
+        根据命令/预处理器的有效场景更新 Intent 值
+
+        直接操作 _intents 位掩码和 _intent_calculator，
+        不再注册 dummy handler（避免产生误导性日志和 handler 覆盖问题）。
+
+        必须在 WebSocket Identify 之前调用，确保 intents 值正确。
+
+        Args:
+            valid_scenes: 命令或预处理器的有效场景位掩码
+        """
+        if valid_scenes & CommandValidScenes.GUILD:
+            if not self._intent_calculator.has_intent(Intent.GUILD_MESSAGES) and not (
+                self._intent_calculator.has_intent(Intent.PUBLIC_GUILD_MESSAGES)
+            ):
+                if self.is_private:
+                    self._intents |= Intent.GUILD_MESSAGES
+                    self._intent_calculator.register_event("MESSAGE_CREATE")
+                else:
+                    self._intents |= Intent.PUBLIC_GUILD_MESSAGES
+                    self._intent_calculator.register_event("AT_MESSAGE_CREATE")
+        if valid_scenes & CommandValidScenes.DM:
+            if not self._intent_calculator.has_intent(Intent.DIRECT_MESSAGE):
+                self._intents |= Intent.DIRECT_MESSAGE
+                self._intent_calculator.register_event("DIRECT_MESSAGE_CREATE")
+        if (valid_scenes & CommandValidScenes.GROUP) or (
+            valid_scenes & CommandValidScenes.C2C
+        ):
+            if not self._intent_calculator.has_intent(Intent.GROUP_AND_C2C_EVENT):
+                self._intents |= Intent.GROUP_AND_C2C_EVENT
+                self._intent_calculator.register_event("GROUP_AT_MESSAGE_CREATE")
