@@ -48,7 +48,7 @@ bot = Bot(app_id="114514", app_secret="797878")
 @bot.on_group_full_message
 async def handle_all(msg): # msg: Model.GroupMessage
     bot.logger.info(f"收到群{msg.group_id} {msg.author.id} 消息: {msg.content}")
-    await msg.reply(msg.group_id, f"收到群{msg.group_id} {msg.author.id} 消息: {msg.content}")
+    await msg.reply(f"收到群{msg.group_id} {msg.author.id} 消息: {msg.content}")
 
 @bot.on_c2c_message
 async def handle_c2c(msg): # msg: Model.C2CMessage
