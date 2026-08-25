@@ -373,16 +373,22 @@ class Bot:
         return decorator
 
     @property
-    def on_group_message(
+    def on_group_full_message(
         self,
     ) -> "Callable[[Callable[[Model.GroupMessage], Awaitable[None]]], Callable[[Model.GroupMessage], Awaitable[None]]]":
         """
-        全量群聊消息事件
+        群聊全量消息事件（需在 QQ 后台开启“全量群消息”权限）
 
         事件类型: GROUP_MESSAGE_CREATE
         Intent: GROUP_AND_C2C_EVENT (1<<25)
         callback: 类型为 function。该回调函数应包含一个参数，
-            用于接收群聊消息事件对应的模型对象 `Model.GroupMessage`。
+            用于接收群聊全量消息事件对应的模型对象 `Model.GroupMessage`。
+
+        示例:
+            @bot.on_group_full_message
+            async def handle_all(msg: Model.GroupMessage):
+                if msg.treated_msg == "ping":
+                    await msg.reply("pong")
         """
 
         def decorator(
@@ -394,6 +400,13 @@ class Bot:
             return func
 
         return decorator
+
+    @property
+    def on_group_message(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupMessage], Awaitable[None]]], Callable[[Model.GroupMessage], Awaitable[None]]]":
+        """兼容旧名称；等同于 on_group_full_message。"""
+        return self.on_group_full_message
 
     @property
     def on_c2c_message(
