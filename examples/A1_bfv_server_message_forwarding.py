@@ -329,10 +329,25 @@ async def handle_all(msg: Model.GroupMessage):
             await db.commit()
         await msg.reply("已关闭转发")
     elif cmd == 'help':
-        md = MessagesModel.MessageMarkdown(
-            content="![这里写图片描述](https://pic1.imgdb.cn/i/034KA1AOT4o9isiKiS0ZpR.png)"
-        )
-        await msg.reply(md)
+        try:
+            # 步骤1：上传网络图片（通过 URL）
+            result = await bot.api.upload_media(
+                file_type=1,  # 1=图片
+                url="https://pic1.imgdb.cn/i/034KA1AOT4o9isiKiS0ZpR.png",  # 网络图片 URL
+                group_openid=msg.group_openid,
+            )
+
+            #bot.logger.info(f"上传成功，file_info: {result.file_info}")
+
+            # 步骤2：发送消息引用媒体
+            await msg.reply(
+                "有问题联系bfv@050820.xyz",
+                media_file_info=result.file_info,
+            )
+
+        except Exception as e:
+            bot.logger.error(f"发送网络图片失败: {e}")
+            await msg.reply("❌ 网络图片发送失败")
     else:
         await msg.reply(f"未知命令: {cmd}")
 
