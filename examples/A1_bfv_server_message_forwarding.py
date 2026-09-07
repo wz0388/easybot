@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+
 配置文件 config.ini
 [bot]
 app_id = 你的APP_ID
