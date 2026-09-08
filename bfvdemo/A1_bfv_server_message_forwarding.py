@@ -11,6 +11,7 @@ app_secret = 你的APP_SECRET
 获取聊天的api为https://tracker.2788.pro/api/bfv/chat/server/{serverid}，小电视提供，你可以自行选择循环时间，但是你自己看不要影响别人
 app_id与app_secret，从https://q.qq.com 获取，无需实名认证，需要打开全量消息与主动消息
 不建议在大群绑定，由于转发的对话导致群聊或机器人被封禁与本人无关
+目前bot不能分辨是否为管理员/群主/普通成员！！
 pip install aiosqlite aiohttp configparser
 python bot.py
 
