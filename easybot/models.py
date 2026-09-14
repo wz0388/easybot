@@ -435,6 +435,676 @@ class MemberWithGuildID(Member):
         )
 
 
+class GroupMemberRole:
+    """QQ 群成员角色常量"""
+
+    MEMBER = "member"
+    OWNER = "owner"
+    ADMIN = "admin"
+
+
+@dataclass
+class GroupMember(BaseModel):
+    """
+    QQ 群成员对象（基于 openid）
+
+    接口: GET /v2/groups/{group_openid}/members
+    用于 QQ 群聊场景下的成员信息，与频道成员对象（Member）区分。
+    """
+
+    member_openid: str = ""
+    username: str = ""
+    member_role: str = "member"
+    bot: bool = False
+    joined_at: str = ""
+    union_openid: str | None = None
+
+    @property
+    def is_owner(self) -> bool:
+        """是否为群主"""
+        return self.member_role == GroupMemberRole.OWNER
+
+    @property
+    def is_admin(self) -> bool:
+        """是否为管理员或群主"""
+        return self.member_role in (GroupMemberRole.OWNER, GroupMemberRole.ADMIN)
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "GroupMember | None":
+        if data is None:
+            return None
+
+        return cls(
+            member_openid=data.get("member_openid", ""),
+            username=data.get("username", ""),
+            member_role=data.get("member_role", GroupMemberRole.MEMBER),
+            bot=bool(data.get("bot", False)),
+            joined_at=data.get("joined_at", ""),
+            union_openid=data.get("union_openid"),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class GroupMembersResponse(BaseModel):
+    """
+    获取群成员列表响应
+
+    接口: GET /v2/groups/{group_openid}/members
+    每次最多返回 30 条，通过 next_cursor 分页；next_cursor 为空串表示已到末页。
+    """
+
+    members: list[GroupMember] = field(default_factory=list)
+    next_cursor: str = ""
+
+    @property
+    def is_end(self) -> bool:
+        """是否已到末页（next_cursor 为空串表示已到末页）"""
+        return not self.next_cursor
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "GroupMembersResponse | None":
+        if data is None:
+            return None
+
+        members_data = data.get("members") or []
+        members = [GroupMember.from_dict(m) for m in members_data if m]
+
+        return cls(
+            members=members,
+            next_cursor=data.get("next_cursor") or "",
+            _raw_data=data,
+        )
+
+
+# ---------- 群管理相关模型 ----------
+
+
+class GroupRestrictChatMode:
+    """群级禁言模式常量"""
+
+    NONE = "none"
+    ALWAYS = "always"
+    SCHEDULE = "schedule"
+
+
+class GroupMuteOp:
+    """群成员禁言操作类型常量"""
+
+    ADD = "add"
+    UPDATE = "update"
+    DEL = "del"
+
+
+class GroupBlacklistOp:
+    """群黑名单操作类型常量"""
+
+    ADD = "add"
+    DEL = "del"
+
+
+class GroupRemoveBlacklistOp:
+    """群批量移除成员的黑名单联动常量"""
+
+    ADD = "add"
+
+
+class JoinRequestApprovalOp:
+    """入群申请审批动作常量"""
+
+    APPROVE = "approve"
+    DECLINE = "decline"
+
+
+class JoinRequestApplySource:
+    """入群申请来源常量"""
+
+    SELF_APPLY = "self_apply"
+    INVITED = "invited"
+
+
+class JoinApprovalStrategyEnable:
+    """入群自动审批策略启用状态常量"""
+
+    ON = "on"
+    OFF = "off"
+
+
+class JoinApprovalStrategyOp:
+    """入群自动审批策略关联群操作常量"""
+
+    ADD = "add"
+    DEL = "del"
+
+
+@dataclass
+class GroupInfo(BaseModel):
+    """
+    群基本信息
+
+    接口: GET /v2/groups/{group_openid}/info
+    """
+
+    group_openid: str = ""
+    group_name: str = ""
+    group_finger_memo: str = ""
+    group_class_text: str = ""
+    group_tags: list[str] = field(default_factory=list)
+    group_member_num: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "GroupInfo | None":
+        if data is None:
+            return None
+
+        return cls(
+            group_openid=data.get("group_openid", ""),
+            group_name=data.get("group_name", ""),
+            group_finger_memo=data.get("group_finger_memo", ""),
+            group_class_text=data.get("group_class_text", ""),
+            group_tags=data.get("group_tags") or [],
+            group_member_num=int(data.get("group_member_num") or 0),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class GroupBotState(BaseModel):
+    """
+    机器人群内状态
+
+    接口: GET /v2/groups/{group_openid}/bot_state
+    """
+
+    member_openid: str = ""
+    joined_at: str = ""
+    allow_proactive_msg: bool = False
+    recv_msg_setting: str = ""
+    member_role: str = "member"
+
+    @property
+    def is_owner(self) -> bool:
+        """机器人是否为群主"""
+        return self.member_role == GroupMemberRole.OWNER
+
+    @property
+    def is_admin(self) -> bool:
+        """机器人是否为管理员或群主"""
+        return self.member_role in (GroupMemberRole.OWNER, GroupMemberRole.ADMIN)
+
+    @property
+    def only_mention(self) -> bool:
+        """是否仅接收 @ 机器人消息"""
+        return self.recv_msg_setting == "only_mention"
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "GroupBotState | None":
+        if data is None:
+            return None
+
+        return cls(
+            member_openid=data.get("member_openid", ""),
+            joined_at=data.get("joined_at", ""),
+            allow_proactive_msg=bool(data.get("allow_proactive_msg", False)),
+            recv_msg_setting=data.get("recv_msg_setting", ""),
+            member_role=data.get("member_role", GroupMemberRole.MEMBER),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class BlacklistUser(BaseModel):
+    """
+    群黑名单用户
+
+    接口: GET /v2/groups/{group_openid}/member_blacklist
+    """
+
+    union_openid: str | None = None
+    member_openid: str = ""
+    username: str = ""
+    banned_at: str = ""
+    bot: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "BlacklistUser | None":
+        if data is None:
+            return None
+
+        return cls(
+            union_openid=data.get("union_openid"),
+            member_openid=data.get("member_openid", ""),
+            username=data.get("username", ""),
+            banned_at=data.get("banned_at", ""),
+            bot=bool(data.get("bot", False)),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class GroupBlacklistResponse(BaseModel):
+    """
+    群黑名单查询响应
+
+    接口: GET /v2/groups/{group_openid}/member_blacklist
+    """
+
+    users: list[BlacklistUser] = field(default_factory=list)
+    next_cursor: str = ""
+
+    @property
+    def is_end(self) -> bool:
+        """是否已到末页"""
+        return not self.next_cursor
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "GroupBlacklistResponse | None":
+        if data is None:
+            return None
+
+        users_data = data.get("users") or []
+        users = [BlacklistUser.from_dict(u) for u in users_data if u]
+
+        return cls(
+            users=users,
+            next_cursor=data.get("next_cursor") or "",
+            _raw_data=data,
+        )
+
+
+@dataclass
+class GroupBlacklistOpResult(BaseModel):
+    """
+    群黑名单操作结果
+
+    接口: POST /v2/groups/{group_openid}/member_blacklist
+    """
+
+    fail_openids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BatchRemoveMembersResult(BaseModel):
+    """
+    群成员批量移除结果
+
+    接口: POST /v2/groups/{group_openid}/batch_remove_members
+    """
+
+    remove_members_result: str = ""
+    add_to_member_blacklist_fail_openids: list[str] = field(default_factory=list)
+
+    @property
+    def is_success(self) -> bool:
+        """是否全部移除成功"""
+        return self.remove_members_result == "success"
+
+
+@dataclass
+class MuteScheduleRule(BaseModel):
+    """群定时禁言规则"""
+
+    task_id: str = ""
+    start_at: str = ""
+    end_at: str = ""
+    enabled: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "MuteScheduleRule | None":
+        if data is None:
+            return None
+
+        return cls(
+            task_id=data.get("task_id", ""),
+            start_at=data.get("start_at", ""),
+            end_at=data.get("end_at", ""),
+            enabled=bool(data.get("enabled", False)),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class MuteRecurringRule(BaseModel):
+    """群周期禁言规则"""
+
+    task_id: str = ""
+    weekdays: list[int] = field(default_factory=list)
+    start_time: str = ""
+    end_time: str = ""
+    enabled: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "MuteRecurringRule | None":
+        if data is None:
+            return None
+
+        return cls(
+            task_id=data.get("task_id", ""),
+            weekdays=data.get("weekdays") or [],
+            start_time=data.get("start_time", ""),
+            end_time=data.get("end_time", ""),
+            enabled=bool(data.get("enabled", False)),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class GlobalMuteRule(BaseModel):
+    """
+    群级禁言规则（全员禁言配置）
+
+    接口: GET /v2/groups/{group_openid}/restrict_chat_setting
+    """
+
+    mode: str = GroupRestrictChatMode.NONE
+    schedule_rules: list[MuteScheduleRule] = field(default_factory=list)
+    recurring_rules: list[MuteRecurringRule] = field(default_factory=list)
+
+    @property
+    def is_enabled(self) -> bool:
+        """是否开启了全员禁言"""
+        return self.mode != GroupRestrictChatMode.NONE
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "GlobalMuteRule | None":
+        if data is None:
+            return None
+
+        schedule_rules_data = data.get("schedule_rules") or []
+        recurring_rules_data = data.get("recurring_rules") or []
+
+        return cls(
+            mode=data.get("mode", GroupRestrictChatMode.NONE),
+            schedule_rules=[
+                MuteScheduleRule.from_dict(r) for r in schedule_rules_data if r
+            ],
+            recurring_rules=[
+                MuteRecurringRule.from_dict(r) for r in recurring_rules_data if r
+            ],
+            _raw_data=data,
+        )
+
+
+@dataclass
+class MemberMuteState(BaseModel):
+    """
+    群成员禁言状态
+
+    接口: GET /v2/groups/{group_openid}/restrict_chat_setting
+    """
+
+    member_openid: str = ""
+    mute_expire_at: str = ""
+    username: str = ""
+    union_openid: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "MemberMuteState | None":
+        if data is None:
+            return None
+
+        return cls(
+            member_openid=data.get("member_openid", ""),
+            mute_expire_at=data.get("mute_expire_at", ""),
+            username=data.get("username", ""),
+            union_openid=data.get("union_openid"),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class GroupRestrictChatSetting(BaseModel):
+    """
+    群禁言状态响应
+
+    接口: GET /v2/groups/{group_openid}/restrict_chat_setting
+    """
+
+    global_rule: GlobalMuteRule | None = None
+    members: list[MemberMuteState] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "GroupRestrictChatSetting | None":
+        if data is None:
+            return None
+
+        members_data = data.get("members") or []
+
+        return cls(
+            global_rule=GlobalMuteRule.from_dict(data.get("global_rule")),
+            members=[MemberMuteState.from_dict(m) for m in members_data if m],
+            _raw_data=data,
+        )
+
+
+@dataclass
+class ReviewQA(BaseModel):
+    """入群验证问答"""
+
+    question: str = ""
+    answer: str = ""
+
+
+@dataclass
+class VerifyInfo(BaseModel):
+    """
+    用户入群验证方式
+
+    接口: 入群申请相关接口 / GROUP_JOIN_REQUEST 事件
+    """
+
+    method: str = ""
+    verify_message: str = ""
+    review_qa_list: list[ReviewQA] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "VerifyInfo | None":
+        if data is None:
+            return None
+
+        qa_data = data.get("review_qa_list") or []
+
+        return cls(
+            method=data.get("method", ""),
+            verify_message=data.get("verify_message", ""),
+            review_qa_list=[ReviewQA.from_dict(qa) for qa in qa_data if qa],
+            _raw_data=data,
+        )
+
+
+@dataclass
+class JoinRequest(BaseModel):
+    """
+    入群申请
+
+    接口: GET /v2/groups/{group_openid}/join_request_list
+    """
+
+    join_request_id: str = ""
+    risk_tips: str = ""
+    top_tips: str = ""
+    union_openid: str | None = None
+    member_openid: str = ""
+    username: str = ""
+    apply_at: str = ""
+    apply_source: str = ""
+    invited_by: str = ""
+    bot: bool = False
+    verify_info: VerifyInfo | None = None
+
+    @property
+    def is_invited(self) -> bool:
+        """是否由其他成员邀请入群"""
+        return self.apply_source == JoinRequestApplySource.INVITED
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "JoinRequest | None":
+        if data is None:
+            return None
+
+        return cls(
+            join_request_id=data.get("join_request_id", ""),
+            risk_tips=data.get("risk_tips", ""),
+            top_tips=data.get("top_tips", ""),
+            union_openid=data.get("union_openid"),
+            member_openid=data.get("member_openid", ""),
+            username=data.get("username", ""),
+            apply_at=data.get("apply_at", ""),
+            apply_source=data.get("apply_source", ""),
+            invited_by=data.get("invited_by", ""),
+            bot=bool(data.get("bot", False)),
+            verify_info=VerifyInfo.from_dict(data.get("verify_info")),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class JoinRequestListResponse(BaseModel):
+    """
+    入群申请列表响应
+
+    接口: GET /v2/groups/{group_openid}/join_request_list
+
+    注意:
+        接口响应字段名为 ``list``，为避免与内置类型冲突，此处映射为 ``requests``。
+    """
+
+    requests: list[JoinRequest] = field(default_factory=list)
+    next_cursor: str = ""
+
+    @property
+    def is_end(self) -> bool:
+        """是否已到末页"""
+        return not self.next_cursor
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "JoinRequestListResponse | None":
+        if data is None:
+            return None
+
+        list_data = data.get("list") or []
+
+        return cls(
+            requests=[JoinRequest.from_dict(r) for r in list_data if r],
+            next_cursor=data.get("next_cursor") or "",
+            _raw_data=data,
+        )
+
+
+@dataclass
+class JoinApprovalStrategy(BaseModel):
+    """
+    入群自动审批策略
+
+    接口: GET /v2/groups/join_approval_strategy
+    """
+
+    strategy_id: str = ""
+    group_openids: list[str] = field(default_factory=list)
+    group_ids: list[str] = field(default_factory=list)
+    whitelist_user_count: int = 0
+    is_enable: str = JoinApprovalStrategyEnable.ON
+    expire_at: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    remark: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        """策略是否启用"""
+        return self.is_enable == JoinApprovalStrategyEnable.ON
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "JoinApprovalStrategy | None":
+        if data is None:
+            return None
+
+        return cls(
+            strategy_id=data.get("strategy_id", ""),
+            group_openids=data.get("group_openids") or [],
+            group_ids=[str(g) for g in (data.get("group_ids") or [])],
+            whitelist_user_count=int(data.get("whitelist_user_count") or 0),
+            is_enable=data.get("is_enable", JoinApprovalStrategyEnable.ON),
+            expire_at=data.get("expire_at", ""),
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
+            remark=data.get("remark", ""),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class JoinApprovalStrategyListResponse(BaseModel):
+    """
+    入群自动审批策略列表响应
+
+    接口: GET /v2/groups/join_approval_strategy
+    """
+
+    strategies: list[JoinApprovalStrategy] = field(default_factory=list)
+    next_cursor: str = ""
+
+    @property
+    def is_end(self) -> bool:
+        """是否已到末页"""
+        return not self.next_cursor
+
+    @classmethod
+    def from_dict(
+        cls, data: dict | None
+    ) -> "JoinApprovalStrategyListResponse | None":
+        if data is None:
+            return None
+
+        strategies_data = data.get("strategies") or []
+
+        return cls(
+            strategies=[
+                JoinApprovalStrategy.from_dict(s) for s in strategies_data if s
+            ],
+            next_cursor=data.get("next_cursor") or "",
+            _raw_data=data,
+        )
+
+
+@dataclass
+class JoinApprovalStrategyCreated(BaseModel):
+    """
+    创建入群自动审批策略响应
+
+    接口: POST /v2/groups/join_approval_strategy
+    """
+
+    strategy_id: str = ""
+    is_enable: str = JoinApprovalStrategyEnable.ON
+    expire_at: str = ""
+
+
+@dataclass
+class JoinApprovalStrategyUpdated(BaseModel):
+    """
+    修改入群自动审批策略响应
+
+    接口: PATCH /v2/groups/join_approval_strategy/{strategy_id}
+    """
+
+    is_enable: str = JoinApprovalStrategyEnable.ON
+    expire_at: str = ""
+
+
+@dataclass
+class WhitelistUsersResponse(BaseModel):
+    """
+    入群自动审批策略白名单操作响应
+
+    接口: POST /v2/groups/join_approval_strategy/{strategy_id}/whitelist_users
+    """
+
+    strategy_id: str = ""
+    whitelist_user_count: int = 0
+    updated_at: str = ""
+
+
 # 频道相关模型
 @dataclass
 class Guild(BaseModel):
@@ -1646,6 +2316,171 @@ class FriendEvent(BaseModel):
     scene_param: str | None = None
 
 
+class SubscribeMessageOp:
+    """订阅消息授权操作常量"""
+
+    ALLOW = 1
+    REJECT = 2
+
+
+@dataclass
+class AutoApproved(BaseModel):
+    """
+    自动审批通过的扩展信息
+
+    仅在下行 GROUP_JOIN_REQUEST 事件中携带。
+    """
+
+    strategy_id: str = ""
+
+
+@dataclass
+class GroupJoinRequestEvent(BaseModel):
+    """
+    用户申请加群事件（事件）
+
+    事件类型: GROUP_JOIN_REQUEST
+    Intent: GROUP_MEMBER_EVENT (1<<24)
+
+    注意:
+        只有当机器人是群管理员时才可以收到此事件。
+    """
+
+    group_openid: str = ""
+    join_request_id: str = ""
+    risk_tips: str = ""
+    top_tips: str = ""
+    union_openid: str | None = None
+    member_openid: str = ""
+    username: str = ""
+    apply_at: str = ""
+    apply_source: str = ""
+    invited_by: str = ""
+    bot: bool = False
+    verify_info: VerifyInfo | None = None
+    auto_approved: AutoApproved | None = None
+
+    @property
+    def is_invited(self) -> bool:
+        """是否由其他成员邀请入群"""
+        return self.apply_source == JoinRequestApplySource.INVITED
+
+    @property
+    def is_auto_approved(self) -> bool:
+        """是否由自动审批策略直接通过"""
+        return self.auto_approved is not None
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "GroupJoinRequestEvent | None":
+        if data is None:
+            return None
+
+        return cls(
+            group_openid=data.get("group_openid", ""),
+            join_request_id=data.get("join_request_id", ""),
+            risk_tips=data.get("risk_tips", ""),
+            top_tips=data.get("top_tips", ""),
+            union_openid=data.get("union_openid"),
+            member_openid=data.get("member_openid", ""),
+            username=data.get("username", ""),
+            apply_at=data.get("apply_at", ""),
+            apply_source=data.get("apply_source", ""),
+            invited_by=data.get("invited_by", ""),
+            bot=bool(data.get("bot", False)),
+            verify_info=VerifyInfo.from_dict(data.get("verify_info")),
+            auto_approved=AutoApproved.from_dict(data.get("auto_approved")),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class GroupMemberEvent(BaseModel):
+    """
+    群成员变动事件（事件）
+
+    事件类型: GROUP_MEMBER_ADD / GROUP_MEMBER_REMOVE
+    Intent: GROUP_MEMBER_EVENT (1<<24)
+    """
+
+    timestamp: int = 0
+    group_openid: str = ""
+    member_openid: str = ""
+    user_openid: str = ""
+
+
+@dataclass
+class SubscribeMsgTemplateResult(BaseModel):
+    """
+    订阅消息模板授权结果
+
+    事件: SUBSCRIBE_MESSAGE_STATUS
+    """
+
+    template_id: int = 0
+    custom_template_id: str = ""
+    op: int = 0
+    subscribe_id: str = ""
+    subscribe_ts: int = 0
+    update_ts: int = 0
+
+    @property
+    def is_allowed(self) -> bool:
+        """用户是否允许订阅"""
+        return self.op == SubscribeMessageOp.ALLOW
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "SubscribeMsgTemplateResult | None":
+        if data is None:
+            return None
+
+        return cls(
+            template_id=int(data.get("template_id") or 0),
+            custom_template_id=data.get("custom_template_id", ""),
+            op=int(data.get("op") or 0),
+            subscribe_id=data.get("subscribe_id", ""),
+            subscribe_ts=int(data.get("subscribe_ts") or 0),
+            update_ts=int(data.get("update_ts") or 0),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class SubscribeMessageStatusEvent(BaseModel):
+    """
+    订阅消息授权状态变更事件（事件）
+
+    事件类型: SUBSCRIBE_MESSAGE_STATUS
+    Intent: GROUP_AND_C2C_EVENT (1<<25)
+
+    可用于判断用户是否允许/拒绝接收某个订阅消息模板。
+    """
+
+    group_openid: str = ""
+    openid: str = ""
+    result: list[SubscribeMsgTemplateResult] = field(default_factory=list)
+
+    def find_template(self, template_id: int) -> SubscribeMsgTemplateResult | None:
+        """按平台模板 ID 查找授权结果"""
+        for item in self.result:
+            if item.template_id == template_id:
+                return item
+        return None
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "SubscribeMessageStatusEvent | None":
+        if data is None:
+            return None
+
+        result_data = data.get("result") or []
+
+        return cls(
+            group_openid=data.get("group_openid", ""),
+            openid=data.get("openid", ""),
+            result=[SubscribeMsgTemplateResult.from_dict(r) for r in result_data if r],
+            _raw_data=data,
+        )
+
+
 @dataclass
 class InteractionDataResolved(BaseModel):
     """互动事件数据解析"""
@@ -2383,6 +3218,384 @@ class StreamMessageResponse(BaseModel):
     ext_info: dict | None = None
 
 
+# ---------- 自定义菜单与指令面板模型 ----------
+
+
+class MenuItemType:
+    """菜单按钮类型常量"""
+
+    SWITCH = "switch"
+    SEND_MESSAGE = "send_message"
+    LINK = "link"
+    MENU = "menu"
+
+
+class PanelScope:
+    """指令面板生效场景常量"""
+
+    C2C = "c2c"
+    GROUP = "group"
+    CHANNEL = "channel"
+    DM = "dm"
+
+
+class PanelTargetType:
+    """指令面板作用范围常量"""
+
+    ALL = "all"
+    SPECIFIC = "specific"
+
+
+class PanelItemType:
+    """指令面板元素类型常量"""
+
+    COMMAND = "command"
+    LINK = "link"
+
+
+class PanelTargetOp:
+    """指令面板关联对象操作常量"""
+
+    ADD = "add"
+    DEL = "del"
+
+
+@dataclass
+class MenuSwitch(BaseModel):
+    """菜单开关配置"""
+
+    switch_id: str = ""
+    default: bool = False
+
+
+@dataclass
+class SubMenuItem(BaseModel):
+    """
+    二级菜单项
+
+    仅 ``type=menu`` 的菜单项有效，最多 5 个，不支持再嵌套。
+    """
+
+    name: str = ""
+    type: str = ""
+    send_message: str = ""
+    link: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "SubMenuItem | None":
+        if data is None:
+            return None
+
+        return cls(
+            name=data.get("name", ""),
+            type=data.get("type", ""),
+            send_message=data.get("send_message", ""),
+            link=data.get("link", ""),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class MenuItem(BaseModel):
+    """
+    菜单项
+
+    接口: GET / PUT /v2/menu
+    """
+
+    name: str = ""
+    type: str = ""
+    sub_menu_items: list[SubMenuItem] = field(default_factory=list)
+    send_message: str = ""
+    link: str = ""
+    switch: MenuSwitch | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "MenuItem | None":
+        if data is None:
+            return None
+
+        sub_menu_data = data.get("sub_menu_items") or []
+
+        return cls(
+            name=data.get("name", ""),
+            type=data.get("type", ""),
+            sub_menu_items=[SubMenuItem.from_dict(s) for s in sub_menu_data if s],
+            send_message=data.get("send_message", ""),
+            link=data.get("link", ""),
+            switch=MenuSwitch.from_dict(data.get("switch")),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class Menu(BaseModel):
+    """
+    自定义菜单配置
+
+    接口: GET / PUT /v2/menu
+    """
+
+    items: list[MenuItem] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "Menu | None":
+        if data is None:
+            return None
+
+        items_data = data.get("items") or []
+
+        return cls(
+            items=[MenuItem.from_dict(i) for i in items_data if i],
+            _raw_data=data,
+        )
+
+    def to_dict(self) -> dict:
+        """转换为接口请求体格式（未设置过的菜单返回空字典）"""
+        if not self.items:
+            return {}
+        return {"items": [self._item_to_dict(item) for item in self.items]}
+
+    @classmethod
+    def _item_to_dict(cls, item: "MenuItem") -> dict:
+        payload: dict[str, Any] = {}
+        if item.name:
+            payload["name"] = item.name
+        if item.type:
+            payload["type"] = item.type
+        if item.sub_menu_items:
+            payload["sub_menu_items"] = [
+                {
+                    k: v
+                    for k, v in (
+                        ("name", sub.name),
+                        ("type", sub.type),
+                        ("send_message", sub.send_message),
+                        ("link", sub.link),
+                    )
+                    if v
+                }
+                for sub in item.sub_menu_items
+            ]
+        if item.send_message:
+            payload["send_message"] = item.send_message
+        if item.link:
+            payload["link"] = item.link
+        if item.switch is not None:
+            payload["switch"] = {
+                "switch_id": item.switch.switch_id,
+                "default": item.switch.default,
+            }
+        return payload
+
+
+@dataclass
+class MenuResponse(BaseModel):
+    """
+    查询全局自定义菜单响应
+
+    接口: GET /v2/menu
+    """
+
+    version: int = 0
+    menu: Menu | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "MenuResponse | None":
+        if data is None:
+            return None
+
+        return cls(
+            version=int(data.get("version") or 0),
+            menu=Menu.from_dict(data.get("menu")),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class MenuVersionResponse(BaseModel):
+    """
+    修改全局自定义菜单响应
+
+    接口: PUT /v2/menu
+    """
+
+    version: int = 0
+
+
+@dataclass
+class PanelItem(BaseModel):
+    """
+    指令面板元素
+
+    接口: /v2/panels 相关接口
+    """
+
+    name: str = ""
+    desc: str = ""
+    type: str = ""
+    only_admin: bool = False
+    link: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "PanelItem | None":
+        if data is None:
+            return None
+
+        return cls(
+            name=data.get("name", ""),
+            desc=data.get("desc", ""),
+            type=data.get("type", ""),
+            only_admin=bool(data.get("only_admin", False)),
+            link=data.get("link", ""),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class Panel(BaseModel):
+    """
+    指令面板配置内容
+
+    接口: /v2/panels 相关接口
+    """
+
+    items: list[PanelItem] = field(default_factory=list)
+    remark: str = ""
+    version: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "Panel | None":
+        if data is None:
+            return None
+
+        items_data = data.get("items") or []
+
+        return cls(
+            items=[PanelItem.from_dict(i) for i in items_data if i],
+            remark=data.get("remark", ""),
+            version=int(data.get("version") or 0),
+            _raw_data=data,
+        )
+
+    def to_dict(self) -> dict:
+        """转换为接口请求体格式"""
+        payload: dict[str, Any] = {}
+        if self.items:
+            items = []
+            for item in self.items:
+                one: dict[str, Any] = {}
+                if item.name:
+                    one["name"] = item.name
+                if item.desc:
+                    one["desc"] = item.desc
+                if item.type:
+                    one["type"] = item.type
+                if item.only_admin:
+                    one["only_admin"] = True
+                if item.link:
+                    one["link"] = item.link
+                items.append(one)
+            payload["items"] = items
+        if self.remark:
+            payload["remark"] = self.remark
+        if self.version:
+            payload["version"] = self.version
+        return payload
+
+
+@dataclass
+class PanelRecord(BaseModel):
+    """
+    指令面板记录
+
+    接口: GET /v2/panels、GET /v2/panels/{panel_id}
+    """
+
+    panel_id: str = ""
+    scope: str = ""
+    target_type: str = PanelTargetType.ALL
+    panel: Panel | None = None
+    created_at: str = ""
+    updated_at: str = ""
+    version: int = 0
+    user_openids: list[str] = field(default_factory=list)
+    group_openids: list[str] = field(default_factory=list)
+
+    @property
+    def is_global(self) -> bool:
+        """是否为全局配置（对所有用户/群生效）"""
+        return self.target_type == PanelTargetType.ALL
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "PanelRecord | None":
+        if data is None:
+            return None
+
+        return cls(
+            panel_id=data.get("panel_id", ""),
+            scope=data.get("scope", ""),
+            target_type=data.get("target_type", PanelTargetType.ALL),
+            panel=Panel.from_dict(data.get("panel")),
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
+            version=int(data.get("version") or 0),
+            user_openids=data.get("user_openids") or [],
+            group_openids=data.get("group_openids") or [],
+            _raw_data=data,
+        )
+
+
+@dataclass
+class PanelsResponse(BaseModel):
+    """
+    查询指令面板列表响应
+
+    接口: GET /v2/panels
+    """
+
+    records: list[PanelRecord] = field(default_factory=list)
+    next_cursor: str = ""
+    is_end: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "PanelsResponse | None":
+        if data is None:
+            return None
+
+        records_data = data.get("records") or []
+        next_cursor = data.get("next_cursor") or ""
+
+        return cls(
+            records=[PanelRecord.from_dict(r) for r in records_data if r],
+            next_cursor=next_cursor,
+            is_end=bool(data.get("is_end", not next_cursor)),
+            _raw_data=data,
+        )
+
+
+@dataclass
+class PanelCreateResponse(BaseModel):
+    """
+    创建指令面板响应
+
+    接口: POST /v2/panels
+    """
+
+    panel_id: str = ""
+
+
+@dataclass
+class PanelVersionResponse(BaseModel):
+    """
+    修改指令面板响应
+
+    接口: PUT /v2/panels/{panel_id}
+    """
+
+    version: int = 0
+
+
 # 流式消息输入模式常量
 class StreamInputMode:
     """流式消息输入模式"""
@@ -2419,6 +3632,37 @@ class Model:
     Author: TypeAlias = Author
     Member: TypeAlias = Member
     MemberWithGuildID: TypeAlias = MemberWithGuildID
+    GroupMember: TypeAlias = GroupMember
+    GroupMemberRole: TypeAlias = GroupMemberRole
+    GroupMembersResponse: TypeAlias = GroupMembersResponse
+
+    GroupInfo: TypeAlias = GroupInfo
+    GroupBotState: TypeAlias = GroupBotState
+    BlacklistUser: TypeAlias = BlacklistUser
+    GroupBlacklistResponse: TypeAlias = GroupBlacklistResponse
+    GroupBlacklistOpResult: TypeAlias = GroupBlacklistOpResult
+    BatchRemoveMembersResult: TypeAlias = BatchRemoveMembersResult
+    GroupRestrictChatMode: TypeAlias = GroupRestrictChatMode
+    GroupMuteOp: TypeAlias = GroupMuteOp
+    GroupBlacklistOp: TypeAlias = GroupBlacklistOp
+    GlobalMuteRule: TypeAlias = GlobalMuteRule
+    MuteScheduleRule: TypeAlias = MuteScheduleRule
+    MuteRecurringRule: TypeAlias = MuteRecurringRule
+    MemberMuteState: TypeAlias = MemberMuteState
+    GroupRestrictChatSetting: TypeAlias = GroupRestrictChatSetting
+    ReviewQA: TypeAlias = ReviewQA
+    VerifyInfo: TypeAlias = VerifyInfo
+    JoinRequest: TypeAlias = JoinRequest
+    JoinRequestListResponse: TypeAlias = JoinRequestListResponse
+    JoinRequestApprovalOp: TypeAlias = JoinRequestApprovalOp
+    JoinRequestApplySource: TypeAlias = JoinRequestApplySource
+    JoinApprovalStrategy: TypeAlias = JoinApprovalStrategy
+    JoinApprovalStrategyListResponse: TypeAlias = JoinApprovalStrategyListResponse
+    JoinApprovalStrategyCreated: TypeAlias = JoinApprovalStrategyCreated
+    JoinApprovalStrategyUpdated: TypeAlias = JoinApprovalStrategyUpdated
+    JoinApprovalStrategyEnable: TypeAlias = JoinApprovalStrategyEnable
+    JoinApprovalStrategyOp: TypeAlias = JoinApprovalStrategyOp
+    WhitelistUsersResponse: TypeAlias = WhitelistUsersResponse
 
     Guild: TypeAlias = Guild
     Channel: TypeAlias = Channel
@@ -2446,6 +3690,12 @@ class Model:
     OpenForumEvent: TypeAlias = OpenForumEvent
     GroupEvent: TypeAlias = GroupEvent
     FriendEvent: TypeAlias = FriendEvent
+    GroupJoinRequestEvent: TypeAlias = GroupJoinRequestEvent
+    GroupMemberEvent: TypeAlias = GroupMemberEvent
+    AutoApproved: TypeAlias = AutoApproved
+    SubscribeMessageStatusEvent: TypeAlias = SubscribeMessageStatusEvent
+    SubscribeMsgTemplateResult: TypeAlias = SubscribeMsgTemplateResult
+    SubscribeMessageOp: TypeAlias = SubscribeMessageOp
     Interaction: TypeAlias = Interaction
 
     OpCode: TypeAlias = OpCode
@@ -2477,6 +3727,24 @@ class Model:
     UrlLinkResponse: TypeAlias = UrlLinkResponse
     MuteBatchResponse: TypeAlias = MuteBatchResponse
     StreamMessageResponse: TypeAlias = StreamMessageResponse
+
+    Menu: TypeAlias = Menu
+    MenuItem: TypeAlias = MenuItem
+    MenuItemType: TypeAlias = MenuItemType
+    MenuSwitch: TypeAlias = MenuSwitch
+    SubMenuItem: TypeAlias = SubMenuItem
+    MenuResponse: TypeAlias = MenuResponse
+    MenuVersionResponse: TypeAlias = MenuVersionResponse
+    Panel: TypeAlias = Panel
+    PanelItem: TypeAlias = PanelItem
+    PanelItemType: TypeAlias = PanelItemType
+    PanelRecord: TypeAlias = PanelRecord
+    PanelsResponse: TypeAlias = PanelsResponse
+    PanelScope: TypeAlias = PanelScope
+    PanelTargetType: TypeAlias = PanelTargetType
+    PanelTargetOp: TypeAlias = PanelTargetOp
+    PanelCreateResponse: TypeAlias = PanelCreateResponse
+    PanelVersionResponse: TypeAlias = PanelVersionResponse
     StreamInputMode: TypeAlias = StreamInputMode
     StreamInputState: TypeAlias = StreamInputState
     StreamContentType: TypeAlias = StreamContentType

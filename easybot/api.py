@@ -267,6 +267,7 @@ class API:
         is_wakeup: bool = False,
         message_reference_id: str | None = None,
         ignore_message_reference_error: bool = False,
+        force_verify_image_resource: bool = False,
         response_model: type = Model.GuildMessage,
         **kwargs,
     ) -> Any:
@@ -286,6 +287,8 @@ class API:
             is_wakeup: 是否发送互动召回消息（仅 QQ 单聊 v2）
             message_reference_id: 引用消息 ID
             ignore_message_reference_error: 是否忽略引用消息错误
+            force_verify_image_resource: 是否强制校验图片资源（仅群聊/单聊 v2）。
+                开启后当图片资源转存失败时会中断消息发送并返回失败，默认关闭
             response_model: 响应模型类
             **kwargs: 其他参数
 
@@ -360,6 +363,8 @@ class API:
                 )
             if msg_type is None:
                 msg_type = getattr(content, "msg_type", None)
+            if force_verify_image_resource:
+                payload["force_verify_image_resource"] = True
             if payload.get("is_wakeup"):
                 if not is_c2c_v2:
                     raise ValueError("is_wakeup 仅支持 QQ 单聊 v2 消息")
@@ -372,6 +377,10 @@ class API:
                 )
             if payload.get("is_wakeup"):
                 raise ValueError("is_wakeup 仅支持 QQ 单聊 v2 消息")
+            if force_verify_image_resource:
+                raise ValueError(
+                    "force_verify_image_resource 仅支持群聊/单聊 v2 消息"
+                )
 
         if msg_id:
             payload["msg_id"] = msg_id
@@ -597,6 +606,7 @@ class API:
         msg_seq: int | None = None,
         message_reference_id: str | None = None,
         ignore_message_reference_error: bool = False,
+        force_verify_image_resource: bool = False,
     ) -> Model.GroupSendMessageResponse:
         """
         发送群聊消息
@@ -615,6 +625,8 @@ class API:
             msg_seq: 回复消息的序号，与 msg_id 联合使用避免重复发送
             message_reference_id: 引用消息 ID
             ignore_message_reference_error: 是否忽略引用消息错误
+            force_verify_image_resource: 是否强制校验图片资源。开启后当图片资源转存失败时
+                会中断消息发送并返回失败，默认关闭
 
         Returns:
             Model.GroupSendMessageResponse: 发送的消息响应
@@ -650,6 +662,7 @@ class API:
             msg_seq=msg_seq,
             message_reference_id=message_reference_id,
             ignore_message_reference_error=ignore_message_reference_error,
+            force_verify_image_resource=force_verify_image_resource,
             response_model=Model.GroupSendMessageResponse,
         )
 
@@ -694,6 +707,7 @@ class API:
         is_wakeup: bool = False,
         message_reference_id: str | None = None,
         ignore_message_reference_error: bool = False,
+        force_verify_image_resource: bool = False,
     ) -> Model.C2CSendMessageResponse:
         """
         发送单聊消息
@@ -713,6 +727,8 @@ class API:
             is_wakeup: 是否发送互动召回消息
             message_reference_id: 引用消息 ID
             ignore_message_reference_error: 是否忽略引用消息错误
+            force_verify_image_resource: 是否强制校验图片资源。开启后当图片资源转存失败时
+                会中断消息发送并返回失败，默认关闭
 
         Returns:
             Model.C2CSendMessageResponse: 发送的消息响应
@@ -749,6 +765,7 @@ class API:
             is_wakeup=is_wakeup,
             message_reference_id=message_reference_id,
             ignore_message_reference_error=ignore_message_reference_error,
+            force_verify_image_resource=force_verify_image_resource,
             response_model=Model.C2CSendMessageResponse,
         )
 
@@ -945,6 +962,942 @@ class API:
             "delete_history_msg_days": delete_history_msg_days,
         }
         await http.delete(f"/guilds/{guild_id}/members/{user_id}", json=payload)
+        return True
+
+    async def get_group_members(
+        self,
+        group_openid: str,
+        cursor: str | None = None,
+    ) -> Model.GroupMembersResponse:
+        """
+        获取群成员列表
+
+        接口: GET /v2/groups/{group_openid}/members
+        每次最多返回 30 条，支持分页。
+
+        注意:
+            该能力当前处于内邀接入阶段，仅白名单机器人可用；
+            无权限时返回错误码 11253（应用无接口访问权限）。
+
+        Args:
+            group_openid: 群 OpenID
+            cursor: 分页游标，首次请求可不传或传空串；后续传上一次响应的 next_cursor
+
+        Returns:
+            Model.GroupMembersResponse: 包含 members（成员列表）与 next_cursor（下一页游标）的响应
+
+        使用示例：
+            # 首次获取
+            resp = await api.get_group_members("3E5D8A1F7B2C9E4D6A0F1B3C5D7E9F2A")
+            for member in resp.members:
+                print(member.member_openid, member.username, member.member_role)
+
+            # 翻页（next_cursor 为空串表示已到末页）
+            if not resp.is_end:
+                nxt = await api.get_group_members(group_openid, cursor=resp.next_cursor)
+        """
+        http = await self._get_http()
+        params = {"cursor": cursor or ""}
+        data = await http.get(f"/v2/groups/{group_openid}/members", params=params)
+        return Model.GroupMembersResponse.from_dict(data)
+
+    async def get_all_group_members(
+        self,
+        group_openid: str,
+        max_count: int | None = None,
+    ) -> list[Model.GroupMember]:
+        """
+        获取群成员全量列表（自动翻页）
+
+        封装 get_group_members，按 next_cursor 持续拉取直到末页。
+
+        Args:
+            group_openid: 群 OpenID
+            max_count: 最多拉取人数，None 表示不限制
+
+        Returns:
+            list[Model.GroupMember]: 群成员列表
+
+        使用示例：
+            members = await api.get_all_group_members(group_openid)
+            admins = [m for m in members if m.is_admin]
+        """
+        http = await self._get_http()
+        members: list[Model.GroupMember] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        page = 0
+
+        while True:
+            params = {"cursor": cursor or ""}
+            data = await http.get(
+                f"/v2/groups/{group_openid}/members", params=params
+            )
+            response = Model.GroupMembersResponse.from_dict(data)
+            if response is None:
+                break
+
+            members.extend(response.members)
+            page += 1
+
+            self._logger.debug(
+                f"获取群成员列表: group_openid={group_openid}, page={page}, "
+                f"累计={len(members)}, next_cursor={response.next_cursor or '(空)'}"
+            )
+
+            if max_count is not None and len(members) >= max_count:
+                return members[:max_count]
+
+            if response.is_end:
+                break
+
+            # 防止游标异常导致死循环
+            if response.next_cursor in seen_cursors:
+                self._logger.warning(
+                    f"群成员列表游标重复，终止翻页: group_openid={group_openid}, "
+                    f"cursor={response.next_cursor}"
+                )
+                break
+
+            seen_cursors.add(response.next_cursor)
+            cursor = response.next_cursor
+
+        return members
+
+    # ==================== 群管理 API ====================
+
+    async def get_group_info(self, group_openid: str) -> Model.GroupInfo:
+        """
+        获取群基本信息
+
+        接口: GET /v2/groups/{group_openid}/info
+
+        注意:
+            需申请接口权限，无权限时返回错误码 11253。
+
+        Args:
+            group_openid: 群 OpenID
+
+        Returns:
+            Model.GroupInfo: 群基本信息（名称、简介、分类、标签、成员数）
+
+        使用示例：
+            info = await api.get_group_info(group_openid)
+            print(info.group_name, info.group_member_num)
+        """
+        http = await self._get_http()
+        data = await http.get(f"/v2/groups/{group_openid}/info")
+        return Model.GroupInfo.from_dict(data)
+
+    async def get_group_bot_state(self, group_openid: str) -> Model.GroupBotState:
+        """
+        获取机器人群内状态
+
+        接口: GET /v2/groups/{group_openid}/bot_state
+
+        Args:
+            group_openid: 群 OpenID
+
+        Returns:
+            Model.GroupBotState: 机器人自身在该群的状态（角色、入群时间、消息接收设置等）
+        """
+        http = await self._get_http()
+        data = await http.get(f"/v2/groups/{group_openid}/bot_state")
+        return Model.GroupBotState.from_dict(data)
+
+    async def get_group_member(
+        self,
+        group_openid: str,
+        member_openid: str,
+    ) -> Model.GroupMember:
+        """
+        获取群成员信息
+
+        接口: GET /v2/groups/{group_openid}/members/{member_openid}
+
+        Args:
+            group_openid: 群 OpenID
+            member_openid: 成员 OpenID
+
+        Returns:
+            Model.GroupMember: 群成员详情
+        """
+        http = await self._get_http()
+        data = await http.get(
+            f"/v2/groups/{group_openid}/members/{member_openid}"
+        )
+        return Model.GroupMember.from_dict(data)
+
+    async def batch_remove_group_members(
+        self,
+        group_openid: str,
+        member_openids: list[str],
+        add_to_member_blacklist: bool = False,
+    ) -> Model.BatchRemoveMembersResult:
+        """
+        群成员批量移除
+
+        接口: POST /v2/groups/{group_openid}/batch_remove_members
+
+        Args:
+            group_openid: 群 OpenID
+            member_openids: 需要移除的成员 openid 列表，单次最多 20 个
+            add_to_member_blacklist: 是否同时加入群黑名单，默认 False
+
+        Returns:
+            Model.BatchRemoveMembersResult: 移除结果，含拉黑失败的 openid 列表
+
+        使用示例：
+            result = await api.batch_remove_group_members(group_openid, ["openid1"])
+            if result.is_success:
+                print("移除成功")
+        """
+        if not member_openids:
+            raise ValueError("member_openids 不能为空")
+        if len(member_openids) > 20:
+            raise ValueError("member_openids 单次最多 20 个")
+
+        http = await self._get_http()
+        payload = {
+            "member_openids": member_openids,
+            "add_to_member_blacklist": add_to_member_blacklist,
+        }
+        data = await http.post(
+            f"/v2/groups/{group_openid}/batch_remove_members", json=payload
+        )
+        return Model.BatchRemoveMembersResult.from_dict(data)
+
+    async def get_group_member_blacklist(
+        self,
+        group_openid: str,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Model.GroupBlacklistResponse:
+        """
+        群黑名单查询
+
+        接口: GET /v2/groups/{group_openid}/member_blacklist
+
+        Args:
+            group_openid: 群 OpenID
+            cursor: 分页游标，首次不传或传空串
+            limit: 单页数量，默认 20，最大 100
+
+        Returns:
+            Model.GroupBlacklistResponse: 黑名单用户列表与下一页游标
+        """
+        http = await self._get_http()
+        params: dict[str, Any] = {"cursor": cursor or ""}
+        if limit is not None:
+            params["limit"] = limit
+        data = await http.get(
+            f"/v2/groups/{group_openid}/member_blacklist", params=params
+        )
+        return Model.GroupBlacklistResponse.from_dict(data)
+
+    async def operate_group_member_blacklist(
+        self,
+        group_openid: str,
+        op: str,
+        member_openids: list[str],
+    ) -> Model.GroupBlacklistOpResult:
+        """
+        群黑名单操作（批量加入 / 移出）
+
+        接口: POST /v2/groups/{group_openid}/member_blacklist
+
+        Args:
+            group_openid: 群 OpenID
+            op: 操作类型，``add`` 加入黑名单、``del`` 移出黑名单
+                （可用 Model.GroupBlacklistOp）
+            member_openids: 目标成员 openid 列表，单次最多 20 个
+
+        Returns:
+            Model.GroupBlacklistOpResult: 操作结果，含失败的 openid 列表
+
+        注意:
+            目标成员仍在群中时无法加入黑名单。
+        """
+        if op not in (Model.GroupBlacklistOp.ADD, Model.GroupBlacklistOp.DEL):
+            raise ValueError("op 仅支持 add / del")
+        if not member_openids:
+            raise ValueError("member_openids 不能为空")
+        if len(member_openids) > 20:
+            raise ValueError("member_openids 单次最多 20 个")
+
+        http = await self._get_http()
+        payload = {"op": op, "member_openids": member_openids}
+        data = await http.post(
+            f"/v2/groups/{group_openid}/member_blacklist", json=payload
+        )
+        return Model.GroupBlacklistOpResult.from_dict(data)
+
+    async def add_group_member_blacklist(
+        self,
+        group_openid: str,
+        member_openids: list[str],
+    ) -> Model.GroupBlacklistOpResult:
+        """批量加入群黑名单（operate_group_member_blacklist 的便捷封装）"""
+        return await self.operate_group_member_blacklist(
+            group_openid, Model.GroupBlacklistOp.ADD, member_openids
+        )
+
+    async def remove_group_member_blacklist(
+        self,
+        group_openid: str,
+        member_openids: list[str],
+    ) -> Model.GroupBlacklistOpResult:
+        """批量移出群黑名单（operate_group_member_blacklist 的便捷封装）"""
+        return await self.operate_group_member_blacklist(
+            group_openid, Model.GroupBlacklistOp.DEL, member_openids
+        )
+
+    async def get_group_restrict_chat_setting(
+        self,
+        group_openid: str,
+    ) -> Model.GroupRestrictChatSetting:
+        """
+        查询群禁言状态
+
+        接口: GET /v2/groups/{group_openid}/restrict_chat_setting
+
+        Args:
+            group_openid: 群 OpenID
+
+        Returns:
+            Model.GroupRestrictChatSetting: 群级禁言规则与当前禁言中的成员列表
+
+        使用示例：
+            setting = await api.get_group_restrict_chat_setting(group_openid)
+            if setting.global_rule and setting.global_rule.is_enabled:
+                print("全员禁言中:", setting.global_rule.mode)
+        """
+        http = await self._get_http()
+        data = await http.get(f"/v2/groups/{group_openid}/restrict_chat_setting")
+        return Model.GroupRestrictChatSetting.from_dict(data)
+
+    async def set_group_member_mute(
+        self,
+        group_openid: str,
+        members: list[dict],
+    ) -> bool:
+        """
+        设置群成员禁言
+
+        接口: POST /v2/groups/{group_openid}/restrict_chat_setting
+
+        Args:
+            group_openid: 群 OpenID
+            members: 禁言配置列表，单次最多 20 个，每项为字典：
+                - ``op``: 必填，``add`` 增加禁言 / ``update`` 更新到期时间 / ``del`` 解除禁言
+                - ``member_openid``: 必填，被禁言成员 openid
+                - ``mute_expire_at``: 禁言到期时间（RFC3339）；``op=del`` 可传空串立即解除
+
+        Returns:
+            bool: 是否设置成功
+
+        注意:
+            增加/更新时只能操作普通成员，不能操作群主、管理员、机器人。
+
+        使用示例：
+            await api.set_group_member_mute(
+                group_openid,
+                [{
+                    "op": "add",
+                    "member_openid": "xxx",
+                    "mute_expire_at": "2026-08-05T11:23:05+08:00",
+                }],
+            )
+        """
+        if not members:
+            raise ValueError("members 不能为空")
+        if len(members) > 20:
+            raise ValueError("members 单次最多 20 个")
+
+        http = await self._get_http()
+        await http.post(
+            f"/v2/groups/{group_openid}/restrict_chat_setting",
+            json={"members": members},
+        )
+        return True
+
+    async def mute_group_members(
+        self,
+        group_openid: str,
+        member_openids: list[str],
+        mute_expire_at: str,
+    ) -> bool:
+        """
+        批量禁言群成员（set_group_member_mute 的便捷封装）
+
+        Args:
+            group_openid: 群 OpenID
+            member_openids: 被禁言成员 openid 列表，最多 20 个
+            mute_expire_at: 禁言到期时间（RFC3339 格式）
+        """
+        if len(member_openids) > 20:
+            raise ValueError("member_openids 单次最多 20 个")
+        return await self.set_group_member_mute(
+            group_openid,
+            [
+                {
+                    "op": Model.GroupMuteOp.ADD,
+                    "member_openid": openid,
+                    "mute_expire_at": mute_expire_at,
+                }
+                for openid in member_openids
+            ],
+        )
+
+    async def unmute_group_members(
+        self,
+        group_openid: str,
+        member_openids: list[str],
+    ) -> bool:
+        """
+        批量解除群成员禁言（set_group_member_mute 的便捷封装）
+
+        Args:
+            group_openid: 群 OpenID
+            member_openids: 成员 openid 列表，最多 20 个
+        """
+        if len(member_openids) > 20:
+            raise ValueError("member_openids 单次最多 20 个")
+        return await self.set_group_member_mute(
+            group_openid,
+            [
+                {
+                    "op": Model.GroupMuteOp.DEL,
+                    "member_openid": openid,
+                    "mute_expire_at": "",
+                }
+                for openid in member_openids
+            ],
+        )
+
+    async def get_group_join_requests(
+        self,
+        group_openid: str,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Model.JoinRequestListResponse:
+        """
+        入群申请列表拉取
+
+        接口: GET /v2/groups/{group_openid}/join_request_list
+
+        Args:
+            group_openid: 群 OpenID
+            cursor: 分页游标，首次不传或传空串
+            limit: 单页数量，默认 20，最大 50
+
+        Returns:
+            Model.JoinRequestListResponse: 入群申请列表（字段映射为 ``requests``）
+        """
+        http = await self._get_http()
+        params: dict[str, Any] = {"cursor": cursor or ""}
+        if limit is not None:
+            params["limit"] = limit
+        data = await http.get(
+            f"/v2/groups/{group_openid}/join_request_list", params=params
+        )
+        return Model.JoinRequestListResponse.from_dict(data)
+
+    async def approval_join_request(
+        self,
+        group_openid: str,
+        member_openid: str,
+        op: str,
+        join_request_id: str | None = None,
+        reject_reason: str | None = None,
+        add_to_member_blacklist: bool = False,
+    ) -> bool:
+        """
+        入群申请审批
+
+        接口: POST /v2/groups/{group_openid}/approval_join_request/{member_openid}
+
+        Args:
+            group_openid: 群 OpenID
+            member_openid: 申请人 openid
+            op: 审批动作，``approve`` 通过 / ``decline`` 拒绝
+                （可用 Model.JoinRequestApprovalOp）
+            join_request_id: 申请 ID（来自入群申请列表或 GROUP_JOIN_REQUEST 事件）
+            reject_reason: 拒绝理由，``op=decline`` 时可填
+            add_to_member_blacklist: 是否同时加入群黑名单，默认 False
+
+        Returns:
+            bool: 是否审批成功
+        """
+        if op not in (
+            Model.JoinRequestApprovalOp.APPROVE,
+            Model.JoinRequestApprovalOp.DECLINE,
+        ):
+            raise ValueError("op 仅支持 approve / decline")
+
+        payload: dict[str, Any] = {"op": op}
+        if join_request_id:
+            payload["join_request_id"] = join_request_id
+        if reject_reason:
+            payload["reject_reason"] = reject_reason
+        if add_to_member_blacklist:
+            payload["add_to_member_blacklist"] = True
+
+        http = await self._get_http()
+        await http.post(
+            f"/v2/groups/{group_openid}/approval_join_request/{member_openid}",
+            json=payload,
+        )
+        return True
+
+    async def approve_join_request(
+        self,
+        group_openid: str,
+        member_openid: str,
+        join_request_id: str | None = None,
+    ) -> bool:
+        """通过入群申请（approval_join_request 的便捷封装）"""
+        return await self.approval_join_request(
+            group_openid,
+            member_openid,
+            Model.JoinRequestApprovalOp.APPROVE,
+            join_request_id=join_request_id,
+        )
+
+    async def decline_join_request(
+        self,
+        group_openid: str,
+        member_openid: str,
+        join_request_id: str | None = None,
+        reject_reason: str | None = None,
+        add_to_member_blacklist: bool = False,
+    ) -> bool:
+        """拒绝入群申请（approval_join_request 的便捷封装）"""
+        return await self.approval_join_request(
+            group_openid,
+            member_openid,
+            Model.JoinRequestApprovalOp.DECLINE,
+            join_request_id=join_request_id,
+            reject_reason=reject_reason,
+            add_to_member_blacklist=add_to_member_blacklist,
+        )
+
+    async def get_join_approval_strategies(
+        self,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Model.JoinApprovalStrategyListResponse:
+        """
+        查询入群自动审批策略列表
+
+        接口: GET /v2/groups/join_approval_strategy
+
+        Args:
+            cursor: 分页游标，首次不传或传空串
+            limit: 单页数量，默认 20，最大 50
+
+        Returns:
+            Model.JoinApprovalStrategyListResponse: 生效中的策略列表
+        """
+        http = await self._get_http()
+        params: dict[str, Any] = {"cursor": cursor or ""}
+        if limit is not None:
+            params["limit"] = limit
+        data = await http.get("/v2/groups/join_approval_strategy", params=params)
+        return Model.JoinApprovalStrategyListResponse.from_dict(data)
+
+    async def create_join_approval_strategy(
+        self,
+        group_openids: list[str] | None = None,
+        group_ids: list[str] | None = None,
+        is_enable: str = Model.JoinApprovalStrategyEnable.ON,
+        expire_at: str | None = None,
+        remark: str | None = None,
+    ) -> Model.JoinApprovalStrategyCreated:
+        """
+        创建入群自动审批策略
+
+        接口: POST /v2/groups/join_approval_strategy
+
+        Args:
+            group_openids: 关联的群 openid 列表，最多 100 个；与 group_ids 互斥
+            group_ids: 关联的 QQ 群号列表，最多 100 个；与 group_openids 互斥
+            is_enable: 是否启用，``on`` / ``off``，默认 ``on``
+            expire_at: 过期时间（RFC3339），不传默认一年过期
+            remark: 策略备注，最多 255 个汉字
+
+        Returns:
+            Model.JoinApprovalStrategyCreated: 含策略 ID、启用状态与过期时间
+
+        注意:
+            group_openids 与 group_ids 必须二选一。
+        """
+        if bool(group_openids) == bool(group_ids):
+            raise ValueError("group_openids 与 group_ids 必须二选一")
+
+        payload: dict[str, Any] = {"is_enable": is_enable}
+        if group_openids:
+            payload["group_openids"] = group_openids
+        if group_ids:
+            payload["group_ids"] = group_ids
+        if expire_at:
+            payload["expire_at"] = expire_at
+        if remark:
+            payload["remark"] = remark
+
+        http = await self._get_http()
+        data = await http.post("/v2/groups/join_approval_strategy", json=payload)
+        return Model.JoinApprovalStrategyCreated.from_dict(data)
+
+    async def update_join_approval_strategy(
+        self,
+        strategy_id: str,
+        is_enable: str | None = None,
+        expire_at: str | None = None,
+        group_action: dict | None = None,
+        remark: str | None = None,
+    ) -> Model.JoinApprovalStrategyUpdated:
+        """
+        修改入群自动审批策略
+
+        接口: PATCH /v2/groups/join_approval_strategy/{strategy_id}
+
+        Args:
+            strategy_id: 策略 ID
+            is_enable: 是否启用，``on`` / ``off``
+            expire_at: 过期时间（RFC3339）
+            group_action: 关联群增删操作，形如
+                ``{"op": "add", "group_openids": [...]}`` 或
+                ``{"op": "del", "group_ids": [...]}``；
+                群标识形式须与创建时一致
+            remark: 策略备注
+
+        Returns:
+            Model.JoinApprovalStrategyUpdated: 修改后的启用状态与过期时间
+        """
+        payload: dict[str, Any] = {}
+        if is_enable:
+            payload["is_enable"] = is_enable
+        if expire_at:
+            payload["expire_at"] = expire_at
+        if group_action:
+            payload["group_action"] = group_action
+        if remark:
+            payload["remark"] = remark
+
+        if not payload:
+            raise ValueError("至少需要提供一个待修改字段")
+
+        http = await self._get_http()
+        data = await http.patch(
+            f"/v2/groups/join_approval_strategy/{strategy_id}", json=payload
+        )
+        return Model.JoinApprovalStrategyUpdated.from_dict(data)
+
+    async def delete_join_approval_strategy(self, strategy_id: str) -> bool:
+        """
+        删除入群自动审批策略
+
+        接口: DELETE /v2/groups/join_approval_strategy/{strategy_id}
+
+        Args:
+            strategy_id: 策略 ID
+
+        Returns:
+            bool: 是否删除成功
+        """
+        http = await self._get_http()
+        await http.delete(f"/v2/groups/join_approval_strategy/{strategy_id}")
+        return True
+
+    async def execute_join_approval_strategy(self, strategy_id: str) -> bool:
+        """
+        执行入群自动审批策略
+
+        接口: POST /v2/groups/join_approval_strategy/{strategy_id}/execute
+
+        Args:
+            strategy_id: 策略 ID
+
+        Returns:
+            bool: 是否执行成功
+        """
+        http = await self._get_http()
+        await http.post(f"/v2/groups/join_approval_strategy/{strategy_id}/execute")
+        return True
+
+    async def update_join_approval_strategy_whitelist(
+        self,
+        strategy_id: str,
+        op: str,
+        whitelist_users: list[str],
+    ) -> Model.WhitelistUsersResponse:
+        """
+        修改入群自动审批策略的白名单号码
+
+        接口: POST /v2/groups/join_approval_strategy/{strategy_id}/whitelist_users
+
+        Args:
+            strategy_id: 策略 ID
+            op: 操作类型，``add`` 新增 / ``del`` 删除
+                （可用 Model.JoinApprovalStrategyOp）
+            whitelist_users: QQ 号码列表（字符串），单次最多 10000 个
+
+        Returns:
+            Model.WhitelistUsersResponse: 操作后白名单数量与更新时间
+        """
+        if op not in (
+            Model.JoinApprovalStrategyOp.ADD,
+            Model.JoinApprovalStrategyOp.DEL,
+        ):
+            raise ValueError("op 仅支持 add / del")
+        if not whitelist_users:
+            raise ValueError("whitelist_users 不能为空")
+
+        http = await self._get_http()
+        data = await http.post(
+            f"/v2/groups/join_approval_strategy/{strategy_id}/whitelist_users",
+            json={"op": op, "whitelist_users": [str(u) for u in whitelist_users]},
+        )
+        return Model.WhitelistUsersResponse.from_dict(data)
+
+    # ==================== 自定义菜单与指令面板 API ====================
+
+    async def get_menu(self) -> Model.MenuResponse:
+        """
+        查询全局自定义菜单
+
+        接口: GET /v2/menu
+
+        自定义菜单展示在机器人单聊窗口底部，设置后对所有用户生效。
+
+        Returns:
+            Model.MenuResponse: 含菜单版本号与当前生效的菜单配置（未设置过时 menu 为 None）
+        """
+        http = await self._get_http()
+        data = await http.get("/v2/menu")
+        return Model.MenuResponse.from_dict(data)
+
+    async def set_menu(self, menu: "Model.Menu | dict") -> Model.MenuVersionResponse:
+        """
+        修改全局自定义菜单
+
+        接口: PUT /v2/menu
+
+        注意:
+            会覆盖原有的完整菜单配置；菜单项最多 10 个，
+            ``type=menu`` 的二级菜单最多 5 个且不支持再嵌套。
+            链接必须以 ``https://`` 开头。
+
+        Args:
+            menu: Model.Menu 实例或其字典形式，形如 ``{"items": [...]}``
+
+        Returns:
+            Model.MenuVersionResponse: 本次修改后的菜单版本号
+
+        使用示例：
+            await api.set_menu({
+                "items": [
+                    {"type": "send_message", "name": "帮助", "send_message": "/help"},
+                    {"type": "link", "name": "官网", "link": "https://example.com"},
+                ]
+            })
+        """
+        if isinstance(menu, Model.Menu):
+            payload = menu.to_dict()
+        else:
+            payload = dict(menu)
+
+        http = await self._get_http()
+        data = await http.put("/v2/menu", json={"menu": payload})
+        return Model.MenuVersionResponse.from_dict(data)
+
+    async def get_panels(
+        self,
+        scope: str,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Model.PanelsResponse:
+        """
+        查询指令面板列表
+
+        接口: GET /v2/panels
+
+        Args:
+            scope: 生效场景，``c2c`` / ``group`` / ``channel`` / ``dm``
+                （可用 Model.PanelScope）
+            cursor: 分页游标，首次不传或传空串
+            limit: 每页条数，默认 20，最大 50
+
+        Returns:
+            Model.PanelsResponse: 面板记录列表（按设置时间倒序）
+        """
+        if scope not in (
+            Model.PanelScope.C2C,
+            Model.PanelScope.GROUP,
+            Model.PanelScope.CHANNEL,
+            Model.PanelScope.DM,
+        ):
+            raise ValueError("scope 仅支持 c2c / group / channel / dm")
+
+        http = await self._get_http()
+        params: dict[str, Any] = {"scope": scope, "cursor": cursor or ""}
+        if limit is not None:
+            params["limit"] = limit
+        data = await http.get("/v2/panels", params=params)
+        return Model.PanelsResponse.from_dict(data)
+
+    async def create_panel(
+        self,
+        scope: str,
+        panel: "Model.Panel | dict",
+        target_type: str = Model.PanelTargetType.ALL,
+        user_openids: list[str] | None = None,
+        group_openids: list[str] | None = None,
+    ) -> Model.PanelCreateResponse:
+        """
+        创建指令面板
+
+        接口: POST /v2/panels
+
+        Args:
+            scope: 生效场景，``c2c`` / ``group`` / ``channel`` / ``dm``
+            panel: Model.Panel 实例或其字典形式
+            target_type: 作用范围，``all`` 全局 / ``specific`` 指定对象；
+                ``channel`` 与 ``dm`` 场景仅支持 ``all``
+            user_openids: 用户 openid 列表，仅 c2c + specific 时有效，最多 20 个
+            group_openids: 群 openid 列表，仅 group + specific 时有效，最多 20 个
+
+        Returns:
+            Model.PanelCreateResponse: 新创建的面板 ID
+        """
+        if scope not in (
+            Model.PanelScope.C2C,
+            Model.PanelScope.GROUP,
+            Model.PanelScope.CHANNEL,
+            Model.PanelScope.DM,
+        ):
+            raise ValueError("scope 仅支持 c2c / group / channel / dm")
+        if target_type not in (
+            Model.PanelTargetType.ALL,
+            Model.PanelTargetType.SPECIFIC,
+        ):
+            raise ValueError("target_type 仅支持 all / specific")
+        if target_type == Model.PanelTargetType.SPECIFIC and scope not in (
+            Model.PanelScope.C2C,
+            Model.PanelScope.GROUP,
+        ):
+            raise ValueError("channel / dm 场景仅支持 target_type=all")
+
+        payload: dict[str, Any] = {
+            "scope": scope,
+            "target_type": target_type,
+            "panel": panel.to_dict() if isinstance(panel, Model.Panel) else dict(panel),
+        }
+        if user_openids:
+            payload["user_openids"] = user_openids
+        if group_openids:
+            payload["group_openids"] = group_openids
+
+        http = await self._get_http()
+        data = await http.post("/v2/panels", json=payload)
+        return Model.PanelCreateResponse.from_dict(data)
+
+    async def get_panel(self, panel_id: str) -> Model.PanelRecord:
+        """
+        查询指令面板详情
+
+        接口: GET /v2/panels/{panel_id}
+
+        Args:
+            panel_id: 面板 ID
+
+        Returns:
+            Model.PanelRecord: 面板详情，specific 面板会返回关联的用户/群 openid 列表
+        """
+        http = await self._get_http()
+        data = await http.get(f"/v2/panels/{panel_id}")
+        return Model.PanelRecord.from_dict(data)
+
+    async def update_panel(
+        self,
+        panel_id: str,
+        panel: "Model.Panel | dict",
+    ) -> Model.PanelVersionResponse:
+        """
+        修改指令面板
+
+        接口: PUT /v2/panels/{panel_id}
+
+        注意:
+            会覆盖原有的面板元素列表和备注，不影响已关联的用户/群列表。
+
+        Args:
+            panel_id: 面板 ID
+            panel: Model.Panel 实例或其字典形式
+
+        Returns:
+            Model.PanelVersionResponse: 修改后的面板版本号
+        """
+        payload = panel.to_dict() if isinstance(panel, Model.Panel) else dict(panel)
+        http = await self._get_http()
+        data = await http.put(f"/v2/panels/{panel_id}", json={"panel": payload})
+        return Model.PanelVersionResponse.from_dict(data)
+
+    async def delete_panel(self, panel_id: str) -> bool:
+        """
+        删除指令面板
+
+        接口: DELETE /v2/panels/{panel_id}
+
+        Args:
+            panel_id: 面板 ID
+
+        Returns:
+            bool: 是否删除成功
+        """
+        http = await self._get_http()
+        await http.delete(f"/v2/panels/{panel_id}")
+        return True
+
+    async def update_panel_target(
+        self,
+        panel_id: str,
+        op: str,
+        user_openids: list[str] | None = None,
+        group_openids: list[str] | None = None,
+    ) -> bool:
+        """
+        修改指令面板关联对象
+
+        接口: PUT /v2/panels/{panel_id}/target
+
+        Args:
+            panel_id: 面板 ID
+            op: 操作类型，``add`` 添加关联 / ``del`` 移除关联
+                （可用 Model.PanelTargetOp）
+            user_openids: 用户 openid 列表，仅 c2c 场景有效，最多 20 个
+            group_openids: 群 openid 列表，仅 group 场景有效，最多 20 个
+
+        Returns:
+            bool: 是否修改成功
+
+        注意:
+            target_type=all 的全局面板不支持此操作。
+        """
+        if op not in (Model.PanelTargetOp.ADD, Model.PanelTargetOp.DEL):
+            raise ValueError("op 仅支持 add / del")
+        if not user_openids and not group_openids:
+            raise ValueError("user_openids 与 group_openids 至少提供一个")
+
+        payload: dict[str, Any] = {"op": op}
+        if user_openids:
+            payload["user_openids"] = user_openids
+        if group_openids:
+            payload["group_openids"] = group_openids
+
+        http = await self._get_http()
+        await http.put(f"/v2/panels/{panel_id}/target", json=payload)
         return True
 
     async def get_channel_online_nums(

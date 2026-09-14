@@ -815,6 +815,112 @@ class Bot:
         return decorator
 
     @property
+    def on_group_join_request(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupJoinRequestEvent], Awaitable[None]]], Callable[[Model.GroupJoinRequestEvent], Awaitable[None]]]":
+        """
+        用户申请加群事件
+
+        事件类型: GROUP_JOIN_REQUEST
+        Intent: GROUP_MEMBER_EVENT (1<<24)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收事件对应的模型对象 `Model.GroupJoinRequestEvent`。
+
+        注意:
+            只有当机器人是群管理员时才可以收到此事件；
+            该能力需平台授权，未授权时请勿订阅。
+            可通过 `bot.api.approval_join_request(...)` 审批申请。
+
+        示例:
+            @bot.on_group_join_request
+            async def handle_join_request(event: Model.GroupJoinRequestEvent):
+                await bot.api.approve_join_request(
+                    event.group_openid, event.member_openid, event.join_request_id
+                )
+        """
+
+        def decorator(
+            func: "Callable[[Model.GroupJoinRequestEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.GroupJoinRequestEvent], Awaitable[None]]":
+            self._register_handler(
+                "GROUP_JOIN_REQUEST", func, Intent.GROUP_MEMBER_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_group_member_add(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupMemberEvent], Awaitable[None]]], Callable[[Model.GroupMemberEvent], Awaitable[None]]]":
+        """
+        群成员加入事件
+
+        事件类型: GROUP_MEMBER_ADD
+        Intent: GROUP_MEMBER_EVENT (1<<24)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收事件对应的模型对象 `Model.GroupMemberEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.GroupMemberEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.GroupMemberEvent], Awaitable[None]]":
+            self._register_handler(
+                "GROUP_MEMBER_ADD", func, Intent.GROUP_MEMBER_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_group_member_remove(
+        self,
+    ) -> "Callable[[Callable[[Model.GroupMemberEvent], Awaitable[None]]], Callable[[Model.GroupMemberEvent], Awaitable[None]]]":
+        """
+        群成员退出事件
+
+        事件类型: GROUP_MEMBER_REMOVE
+        Intent: GROUP_MEMBER_EVENT (1<<24)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收事件对应的模型对象 `Model.GroupMemberEvent`。
+        """
+
+        def decorator(
+            func: "Callable[[Model.GroupMemberEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.GroupMemberEvent], Awaitable[None]]":
+            self._register_handler(
+                "GROUP_MEMBER_REMOVE", func, Intent.GROUP_MEMBER_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
+    def on_subscribe_message_status(
+        self,
+    ) -> "Callable[[Callable[[Model.SubscribeMessageStatusEvent], Awaitable[None]]], Callable[[Model.SubscribeMessageStatusEvent], Awaitable[None]]]":
+        """
+        订阅消息授权状态变更事件
+
+        事件类型: SUBSCRIBE_MESSAGE_STATUS
+        Intent: GROUP_AND_C2C_EVENT (1<<25)
+        callback: 类型为 function。该回调函数应包含一个参数，
+            用于接收事件对应的模型对象 `Model.SubscribeMessageStatusEvent`。
+
+        可用于判断用户是否允许/拒绝接收某个订阅消息模板。
+        """
+
+        def decorator(
+            func: "Callable[[Model.SubscribeMessageStatusEvent], Awaitable[None]]",
+        ) -> "Callable[[Model.SubscribeMessageStatusEvent], Awaitable[None]]":
+            self._register_handler(
+                "SUBSCRIBE_MESSAGE_STATUS", func, Intent.GROUP_AND_C2C_EVENT
+            )
+            return func
+
+        return decorator
+
+    @property
     def on_friend_add(
         self,
     ) -> "Callable[[Callable[[Model.FriendEvent], Awaitable[None]]], Callable[[Model.FriendEvent], Awaitable[None]]]":

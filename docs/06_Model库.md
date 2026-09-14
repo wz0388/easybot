@@ -283,6 +283,40 @@ await msg.reply(
 | `union_openid` | `str \| None` | union_openid |
 | `union_user_account` | `str \| None` | union 用户标识 |
 
+### 4.4 `GroupMember`
+
+来源：`GET /v2/groups/{group_openid}/members`（群成员列表）
+
+QQ 群成员对象（基于 openid），与频道成员 `Member` 区分。
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `member_openid` | `str` | 成员 OpenID |
+| `username` | `str` | 用户昵称 |
+| `member_role` | `str` | 群成员角色：`member` 普通成员 / `owner` 群主 / `admin` 管理员 |
+| `bot` | `bool` | 是否机器人 |
+| `joined_at` | `str` | 入群时间戳（RFC3339 格式） |
+| `union_openid` | `str \| None` | 用户在应用/开放平台下的统一标识（如有） |
+
+便捷属性：
+
+| 属性 | 类型 | 说明 |
+| --- | --- | --- |
+| `is_owner` | `bool` | 是否为群主 |
+| `is_admin` | `bool` | 是否为管理员或群主 |
+
+### 4.5 `GroupMembersResponse`
+
+来源：`GET /v2/groups/{group_openid}/members`
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `members` | `list[GroupMember]` | 成员列表，每次最多返回 30 条 |
+| `next_cursor` | `str` | 下一页游标，空串表示已到末页 |
+| `is_end` | `bool`（属性） | 是否已到末页 |
+
+角色常量 `Model.GroupMemberRole`：`MEMBER` / `OWNER` / `ADMIN`
+
 ***
 
 ## 五、消息事件
@@ -561,6 +595,95 @@ Interaction 内置 ClassVar 常量：
 | `openid` | `str` | 用户 openid |
 | `scene` | `int \| None` | 场景值 |
 | `scene_param` | `str \| None` | 场景参数 |
+
+### 6.3 `GroupJoinRequestEvent`
+
+来源装饰器：`@bot.on_group_join_request`（事件 `GROUP_JOIN_REQUEST`，Intent `GROUP_MEMBER_EVENT`）
+
+> 只有当机器人是群管理员时才可以收到此事件。
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `group_openid` | `str` | 群 OpenID |
+| `join_request_id` | `str` | 申请 ID，审批时需回传 |
+| `risk_tips` | `str` | 安全提示语 |
+| `top_tips` | `str` | 顶部安全提示语 |
+| `union_openid` | `str \| None` | 用户在应用/开放平台下的统一标识 |
+| `member_openid` | `str` | 申请人 openid |
+| `username` | `str` | 申请人昵称 |
+| `apply_at` | `str` | 申请时间戳（RFC3339） |
+| `apply_source` | `str` | 申请来源：`self_apply` 主动申请 / `invited` 被邀请 |
+| `invited_by` | `str` | 邀请人 openid（`apply_source=invited` 时有效） |
+| `bot` | `bool` | 是否为机器人账号 |
+| `verify_info` | `VerifyInfo \| None` | 入群验证方式 |
+| `auto_approved` | `AutoApproved \| None` | 自动审批通过的扩展信息 |
+
+便捷属性：
+
+| 属性 | 类型 | 说明 |
+| --- | --- | --- |
+| `is_invited` | `bool` | 是否由其他成员邀请入群 |
+| `is_auto_approved` | `bool` | 是否由自动审批策略直接通过 |
+
+结构：`VerifyInfo`
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `method` | `str` | 验证方式：`verify_message` / `admin_review_qa` |
+| `verify_message` | `str` | 验证消息内容 |
+| `review_qa_list` | `list[ReviewQA]` | 问答列表 |
+
+结构：`ReviewQA`
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `question` | `str` | 管理员设置的问题 |
+| `answer` | `str` | 申请人填写的答案 |
+
+结构：`AutoApproved`
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `strategy_id` | `str` | 自动审批通过的策略 ID |
+
+### 6.4 `GroupMemberEvent`
+
+来源装饰器：
+
+- `@bot.on_group_member_add`（`GROUP_MEMBER_ADD`，群成员加入）
+- `@bot.on_group_member_remove`（`GROUP_MEMBER_REMOVE`，群成员退出）
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `timestamp` | `int` | 事件时间戳（Unix 秒） |
+| `group_openid` | `str` | 群 OpenID |
+| `member_openid` | `str` | 变动成员的 OpenID |
+| `user_openid` | `str` | 变动成员的用户 OpenID（可能为空） |
+
+### 6.5 `SubscribeMessageStatusEvent`
+
+来源装饰器：`@bot.on_subscribe_message_status`（事件 `SUBSCRIBE_MESSAGE_STATUS`，Intent `GROUP_AND_C2C_EVENT`）
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `group_openid` | `str` | 群 OpenID（群订阅场景时有值） |
+| `openid` | `str` | 用户 OpenID（个人订阅场景时有值） |
+| `result` | `list[SubscribeMsgTemplateResult]` | 各模板的授权结果列表 |
+
+方法：`find_template(template_id)` 可按平台模板 ID 查找授权结果。
+
+结构：`SubscribeMsgTemplateResult`
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `template_id` | `int` | 平台提供的订阅模板 ID |
+| `custom_template_id` | `str` | 自定义订阅模板 ID |
+| `op` | `int` | 用户操作：`1` 允许订阅 / `2` 拒绝订阅 |
+| `subscribe_id` | `str` | 订阅 ID，发送订阅消息时使用 |
+| `subscribe_ts` | `int` | 订阅操作时间戳（Unix 秒） |
+| `update_ts` | `int` | 状态最后更新时间戳（Unix 秒） |
+
+便捷属性：`is_allowed`（是否允许订阅）。操作常量见 `Model.SubscribeMessageOp`。
 
 ***
 
@@ -985,6 +1108,10 @@ async def handle(event: Model.BaseModel):
 | `@bot.on_group_delete` | `Model.GroupEvent` |
 | `@bot.on_group_msg_reject` | `Model.GroupEvent` |
 | `@bot.on_group_msg_receive` | `Model.GroupEvent` |
+| `@bot.on_group_join_request` | `Model.GroupJoinRequestEvent` |
+| `@bot.on_group_member_add` | `Model.GroupMemberEvent` |
+| `@bot.on_group_member_remove` | `Model.GroupMemberEvent` |
+| `@bot.on_subscribe_message_status` | `Model.SubscribeMessageStatusEvent` |
 | `@bot.on_friend_add` | `Model.FriendEvent` |
 | `@bot.on_friend_delete` | `Model.FriendEvent` |
 | `@bot.on_c2c_msg_reject` | `Model.FriendEvent` |
@@ -1151,6 +1278,133 @@ Model.Message = Model.GuildMessage | Model.GroupMessage | Model.C2CMessage | Mod
 | `file_info` | `str` | 用于发送消息的文件信息 |
 | `ttl` | `int` | 文件有效期（秒） |
 | `id` | `str \| None` | 文件 ID |
+
+***
+
+### 11.10 群管理相关模型
+
+> 相关接口多为内邀 / 申请制能力，无权限时返回错误码 `11253`。
+
+#### `GroupInfo`
+
+群基本信息（`GET /v2/groups/{group_openid}/info`）。
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `group_openid` | `str` | 群 OpenID |
+| `group_name` | `str` | 群名称 |
+| `group_finger_memo` | `str` | 群简介 |
+| `group_class_text` | `str` | 群分类 |
+| `group_tags` | `list[str]` | 群标签列表 |
+| `group_member_num` | `int` | 群成员人数 |
+
+#### `GroupBotState`
+
+机器人在群内的状态（`GET /v2/groups/{group_openid}/bot_state`）。
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `member_openid` | `str` | 机器人的 openid |
+| `joined_at` | `str` | 入群时间戳（RFC3339） |
+| `allow_proactive_msg` | `bool` | 是否接收主动推送 |
+| `recv_msg_setting` | `str` | 接受消息类型：`all` / `only_mention` / `mention_and_context` |
+| `member_role` | `str` | 群成员角色 |
+
+便捷属性：`is_owner`、`is_admin`、`only_mention`。
+
+#### `BlacklistUser` / `GroupBlacklistResponse` / `GroupBlacklistOpResult`
+
+群黑名单相关模型（`/v2/groups/{group_openid}/member_blacklist`）。
+
+| 模型 | 字段 | 说明 |
+| --- | --- | --- |
+| `BlacklistUser` | `union_openid` / `member_openid` / `username` / `banned_at` / `bot` | 单个黑名单用户 |
+| `GroupBlacklistResponse` | `users: list[BlacklistUser]` / `next_cursor` | 黑名单查询响应，含 `is_end` 属性 |
+| `GroupBlacklistOpResult` | `fail_openids: list[str]` | 黑名单操作失败列表 |
+
+#### `BatchRemoveMembersResult`
+
+群成员批量移除结果（`POST /v2/groups/{group_openid}/batch_remove_members`）。
+
+| 字段名 | 类型 | 说明 |
+| --- | --- | --- |
+| `remove_members_result` | `str` | 成功时返回 `success` |
+| `add_to_member_blacklist_fail_openids` | `list[str]` | 拉黑失败的 openid |
+
+便捷属性：`is_success`。
+
+#### `GroupRestrictChatSetting` 及禁言规则
+
+群禁言状态（`GET /v2/groups/{group_openid}/restrict_chat_setting`）。
+
+| 模型 | 字段 | 说明 |
+| --- | --- | --- |
+| `GroupRestrictChatSetting` | `global_rule: GlobalMuteRule \| None` / `members: list[MemberMuteState]` | 群级规则 + 禁言中的成员 |
+| `GlobalMuteRule` | `mode` / `schedule_rules` / `recurring_rules` | `mode` 为 `none` / `always` / `schedule`；含 `is_enabled` 属性 |
+| `MuteScheduleRule` | `task_id` / `start_at` / `end_at` / `enabled` | 定时禁言规则 |
+| `MuteRecurringRule` | `task_id` / `weekdays` / `start_time` / `end_time` / `enabled` | 周期禁言规则（`weekdays` 取 1~7） |
+| `MemberMuteState` | `member_openid` / `mute_expire_at` / `username` / `union_openid` | 成员禁言状态 |
+
+相关常量：`Model.GroupRestrictChatMode`（`NONE` / `ALWAYS` / `SCHEDULE`）、`Model.GroupMuteOp`（`ADD` / `UPDATE` / `DEL`）。
+
+#### `JoinRequest` / `JoinRequestListResponse`
+
+入群申请（`GET /v2/groups/{group_openid}/join_request_list`）。
+
+| 模型 | 字段 | 说明 |
+| --- | --- | --- |
+| `JoinRequest` | `join_request_id` / `risk_tips` / `top_tips` / `union_openid` / `member_openid` / `username` / `apply_at` / `apply_source` / `invited_by` / `bot` / `verify_info` | 单条入群申请，含 `is_invited` 属性 |
+| `JoinRequestListResponse` | `requests: list[JoinRequest]` / `next_cursor` | 列表响应，含 `is_end` 属性 |
+
+> 接口响应字段名为 `list`，为避免与内置类型冲突，SDK 映射为 `requests`。
+
+相关常量：`Model.JoinRequestApprovalOp`（`APPROVE` / `DECLINE`）、`Model.JoinRequestApplySource`（`SELF_APPLY` / `INVITED`）。
+
+#### `JoinApprovalStrategy` 及其响应模型
+
+入群自动审批策略（`/v2/groups/join_approval_strategy` 系列）。
+
+| 模型 | 字段 | 说明 |
+| --- | --- | --- |
+| `JoinApprovalStrategy` | `strategy_id` / `group_openids` / `group_ids` / `whitelist_user_count` / `is_enable` / `expire_at` / `created_at` / `updated_at` / `remark` | 策略详情，含 `enabled` 属性 |
+| `JoinApprovalStrategyListResponse` | `strategies` / `next_cursor` | 列表响应，含 `is_end` 属性 |
+| `JoinApprovalStrategyCreated` | `strategy_id` / `is_enable` / `expire_at` | 创建响应 |
+| `JoinApprovalStrategyUpdated` | `is_enable` / `expire_at` | 修改响应 |
+| `WhitelistUsersResponse` | `strategy_id` / `whitelist_user_count` / `updated_at` | 白名单操作响应 |
+
+相关常量：`Model.JoinApprovalStrategyEnable`（`ON` / `OFF`）、`Model.JoinApprovalStrategyOp`（`ADD` / `DEL`）。
+
+***
+
+### 11.11 自定义菜单与指令面板模型
+
+#### `Menu` / `MenuItem` / `SubMenuItem` / `MenuSwitch`
+
+自定义菜单（`GET` / `PUT /v2/menu`）。
+
+| 模型 | 字段 | 说明 |
+| --- | --- | --- |
+| `Menu` | `items: list[MenuItem]` | 菜单项列表，最多 10 个；提供 `to_dict()` 生成请求体 |
+| `MenuItem` | `name` / `type` / `sub_menu_items` / `send_message` / `link` / `switch` | `type` 可选 `switch` / `send_message` / `link` / `menu` |
+| `SubMenuItem` | `name` / `type` / `send_message` / `link` | 二级菜单，最多 5 个且不支持再嵌套 |
+| `MenuSwitch` | `switch_id` / `default` | 开关配置 |
+
+响应模型：`MenuResponse`（`version` / `menu`）、`MenuVersionResponse`（`version`）。
+常量：`Model.MenuItemType`。
+
+#### `Panel` / `PanelItem` / `PanelRecord`
+
+指令面板（`/v2/panels` 系列）。
+
+| 模型 | 字段 | 说明 |
+| --- | --- | --- |
+| `Panel` | `items: list[PanelItem]` / `remark` / `version` | 面板配置，最多 20 个元素；提供 `to_dict()` |
+| `PanelItem` | `name` / `desc` / `type` / `only_admin` / `link` | `type` 可选 `command` / `link` |
+| `PanelRecord` | `panel_id` / `scope` / `target_type` / `panel` / `created_at` / `updated_at` / `version` / `user_openids` / `group_openids` | 面板记录，含 `is_global` 属性 |
+
+响应模型：`PanelsResponse`（`records` / `next_cursor` / `is_end`）、`PanelCreateResponse`（`panel_id`）、`PanelVersionResponse`（`version`）。
+
+常量：`Model.PanelScope`（`C2C` / `GROUP` / `CHANNEL` / `DM`）、`Model.PanelTargetType`（`ALL` / `SPECIFIC`）、`Model.PanelItemType`（`COMMAND` / `LINK`）、`Model.PanelTargetOp`（`ADD` / `DEL`）。
 
 ***
 

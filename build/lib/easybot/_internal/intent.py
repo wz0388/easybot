@@ -21,13 +21,20 @@ class Intent(IntFlag):
     GUILD_MESSAGE_REACTIONS = 1 << 10
     DIRECT_MESSAGE = 1 << 12
     OPEN_FORUM_EVENT = 1 << 18
+    GROUP_MEMBER_EVENT = 1 << 24
+    GROUP_AND_C2C_EVENT = 1 << 25
     INTERACTION = 1 << 26
     MESSAGE_AUDIT = 1 << 27
     FORUMS_EVENT = 1 << 28
     AUDIO_ACTION = 1 << 29
     PUBLIC_GUILD_MESSAGES = 1 << 30
-    GROUP_AND_C2C_EVENT = 1 << 25
 
+    # 注意:
+    #   GROUP_MEMBER_EVENT (群成员变动 / 入群申请) 属于内邀或需平台授信的能力，
+    #   未获授权的机器人在 Identify 阶段携带该 Intent 会连接失败，
+    #   因此这里不并入 ALL_INTENT_EVENT，需通过
+    #   bot.on_group_member_add / on_group_member_remove / on_group_join_request
+    #   显式订阅（显式订阅时 SDK 会自动追加该 Intent）。
     ALL_INTENT_EVENT = (
         GUILDS
         | GUILD_MEMBERS
@@ -112,6 +119,10 @@ EVENT_INTENT_MAP = {
     "FRIEND_DEL": Intent.GROUP_AND_C2C_EVENT,
     "C2C_MSG_REJECT": Intent.GROUP_AND_C2C_EVENT,
     "C2C_MSG_RECEIVE": Intent.GROUP_AND_C2C_EVENT,
+    "GROUP_JOIN_REQUEST": Intent.GROUP_MEMBER_EVENT,
+    "GROUP_MEMBER_ADD": Intent.GROUP_MEMBER_EVENT,
+    "GROUP_MEMBER_REMOVE": Intent.GROUP_MEMBER_EVENT,
+    "SUBSCRIBE_MESSAGE_STATUS": Intent.GROUP_AND_C2C_EVENT,
 }
 
 

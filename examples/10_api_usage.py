@@ -10,6 +10,9 @@ EasyBot SDK 示例 10：API 使用方法
 - 禁言管理
 - 互动事件处理
 - 富媒体上传
+- 群管理（群信息、成员、黑名单、禁言、入群申请与审批）
+- 自定义菜单与指令面板
+- 群成员变动与订阅消息事件
 
 注意：
 - 频道消息支持 image/file_image 参数直接发送图片
@@ -108,6 +111,29 @@ def main() -> None:
                     title="群公告", content=["公告内容1", "公告内容2"]
                 )
             )
+
+        # ----- 获取群成员列表（需申请内邀权限，无权限返回 11253） -----
+        elif msg.treated_msg == "群成员列表":
+            try:
+                # 方式一：单页获取（每次最多 30 条）
+                resp = await bot.api.get_group_members(msg.group_openid)
+                for member in resp.members:
+                    bot.logger.info(
+                        f"{member.member_openid} / {member.username} / "
+                        f"{member.member_role} / 机器人={member.bot}"
+                    )
+
+                # 方式二：自动翻页获取全量成员
+                members = await bot.api.get_all_group_members(msg.group_openid)
+                admins = [m for m in members if m.is_admin]
+
+                await msg.reply(
+                    f"👥 群成员共 {len(members)} 人\n"
+                    f"管理员以上：{', '.join(m.username for m in admins) or '无'}"
+                )
+            except Exception as e:
+                bot.logger.error(f"获取群成员列表失败: {e}")
+                await msg.reply("❌ 获取群成员失败（可能未开通接口权限）")
 
     # ==================== 10.3 单聊相关 API ====================
     @bot.on_c2c_message
@@ -262,6 +288,184 @@ def main() -> None:
                 await msg.reply(f"👥 当前在线人数：{online.online_nums}")
             except Exception as e:
                 bot.logger.error(f"获取在线人数失败: {e}")
+
+    # ==================== 10.9 群管理 API（需申请接口权限） ====================
+    @bot.on_group_message
+    async def handle_group_management(msg: Model.GroupMessage) -> None:
+        """群管理 API 示例
+
+        注意：群管理相关接口多为内邀 / 申请制能力，无权限时返回错误码 11253。
+        """
+
+        if msg.treated_msg == "群信息":
+            try:
+                info = await bot.api.get_group_info(msg.group_openid)
+                state = await bot.api.get_group_bot_state(msg.group_openid)
+                await msg.reply(
+                    f"📋 {info.group_name}\n"
+                    f"- 成员数：{info.group_member_num}\n"
+                    f"- 标签：{'、'.join(info.group_tags) or '无'}\n"
+                    f"- 机器人角色：{state.member_role}\n"
+                    f"- 接收消息：{state.recv_msg_setting}"
+                )
+            except Exception as e:
+                bot.logger.error(f"获取群信息失败: {e}")
+
+        elif msg.treated_msg == "迁移前统计":
+            # 批量拉取全部成员（自动翻页）
+            try:
+                members = await bot.api.get_all_group_members(msg.group_openid)
+                owners = [m for m in members if m.is_admin]
+                await msg.reply(
+                    f"👥 共 {len(members)} 人\n"
+                    f"管理员以上：{'、'.join(m.username for m in owners) or '无'}"
+                )
+            except Exception as e:
+                bot.logger.error(f"获取群成员失败: {e}")
+
+        elif msg.treated_msg == "入群申请":
+            try:
+                result = await bot.api.get_group_join_requests(
+                    msg.group_openid, limit=20
+                )
+                for req in result.requests:
+                    bot.logger.info(
+                        f"申请ID={req.join_request_id} {req.username} "
+                        f"来源={req.apply_source} 邀请人={req.invited_by}"
+                    )
+                await msg.reply(f"📨 待处理申请 {len(result.requests)} 条")
+            except Exception as e:
+                bot.logger.error(f"拉取入群申请失败: {e}")
+
+        elif msg.treated_msg == "禁言状态":
+            try:
+                setting = await bot.api.get_group_restrict_chat_setting(
+                    msg.group_openid
+                )
+                mode = setting.global_rule.mode if setting.global_rule else "unknown"
+                await msg.reply(
+                    f"🔇 全员禁言模式：{mode}\n"
+                    f"禁言中成员：{len(setting.members)} 人"
+                )
+            except Exception as e:
+                bot.logger.error(f"查询禁言状态失败: {e}")
+
+    # ==================== 10.10 自定义菜单与指令面板 API ====================
+    @bot.on_c2c_message
+    async def handle_menu_panel(msg: Model.C2CMessage) -> None:
+        """自定义菜单与指令面板示例"""
+
+        if msg.treated_msg == "设置菜单":
+            try:
+                # 覆盖式设置全局自定义菜单（最多 10 个菜单项）
+                result = await bot.api.set_menu(
+                    {
+                        "items": [
+                            {
+                                "type": "send_message",
+                                "name": "帮助",
+                                "send_message": "/help",
+                            },
+                            {
+                                "type": "link",
+                                "name": "官网",
+                                "link": "https://example.com",
+                            },
+                            {
+                                "type": "menu",
+                                "name": "更多",
+                                "sub_menu_items": [
+                                    {
+                                        "type": "send_message",
+                                        "name": "设置",
+                                        "send_message": "/settings",
+                                    }
+                                ],
+                            },
+                            {
+                                "type": "switch",
+                                "name": "联网",
+                                "switch": {"switch_id": "search", "default": False},
+                            },
+                        ]
+                    }
+                )
+                bot.logger.info(f"菜单已更新，版本号：{result.version}")
+
+                # 也可以先用 Model.Panel / Model.Menu 构建对象再传入
+                current = await bot.api.get_menu()
+                await msg.reply(f"✅ 菜单已更新（版本 {current.version}）")
+            except Exception as e:
+                bot.logger.error(f"设置菜单失败: {e}")
+
+        elif msg.treated_msg == "创建面板":
+            try:
+                created = await bot.api.create_panel(
+                    scope=Model.PanelScope.C2C,
+                    target_type=Model.PanelTargetType.ALL,
+                    panel={
+                        "items": [
+                            {
+                                "type": Model.PanelItemType.COMMAND,
+                                "name": "查询天气",
+                                "desc": "查询当前天气",
+                            },
+                            {
+                                "type": Model.PanelItemType.LINK,
+                                "name": "更多服务",
+                                "link": "https://example.com",
+                            },
+                        ],
+                        "remark": "C2C 面板",
+                    },
+                )
+                await msg.reply(f"✅ 面板已创建：{created.panel_id}")
+            except Exception as e:
+                bot.logger.error(f"创建面板失败: {e}")
+
+        elif msg.treated_msg == "面板列表":
+            try:
+                panels = await bot.api.get_panels(Model.PanelScope.C2C, limit=20)
+                lines = [
+                    f"- {p.panel_id}（{'全局' if p.is_global else '指定对象'}）"
+                    for p in panels.records
+                ]
+                await msg.reply("📋 面板列表：\n" + ("\n".join(lines) or "暂无"))
+            except Exception as e:
+                bot.logger.error(f"查询面板失败: {e}")
+
+    # ==================== 10.11 群成员变动事件 ====================
+    @bot.on_group_join_request
+    async def handle_join_request(event: Model.GroupJoinRequestEvent) -> None:
+        """用户申请加群事件（需机器人是群管理员）"""
+        bot.logger.info(
+            f"{event.username} 申请入群，来源={event.apply_source}，"
+            f"验证方式={event.verify_info.method if event.verify_info else '无'}"
+        )
+        try:
+            await bot.api.approve_join_request(
+                event.group_openid, event.member_openid, event.join_request_id
+            )
+        except Exception as e:
+            bot.logger.error(f"审批入群申请失败: {e}")
+
+    @bot.on_group_member_add
+    async def handle_member_add(event: Model.GroupMemberEvent) -> None:
+        """群成员加入事件"""
+        bot.logger.info(f"新成员加入：{event.member_openid}（群 {event.group_openid}）")
+
+    @bot.on_group_member_remove
+    async def handle_member_remove(event: Model.GroupMemberEvent) -> None:
+        """群成员退出事件"""
+        bot.logger.info(f"成员退出：{event.member_openid}（群 {event.group_openid}）")
+
+    @bot.on_subscribe_message_status
+    async def handle_subscribe(event: Model.SubscribeMessageStatusEvent) -> None:
+        """订阅消息授权状态变更事件"""
+        for item in event.result:
+            bot.logger.info(
+                f"模板 {item.template_id} {'允许' if item.is_allowed else '拒绝'}订阅"
+            )
 
     bot.start()
 

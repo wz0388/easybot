@@ -8,6 +8,7 @@
 [![Codacy Badge](https://app.codacy.com/project/badge/Grade/f015549b3dba4602be2fe0f5d8b0a8d5)](https://app.codacy.com/gh/SaucePlum/easybot/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
 
 ✨ 轻量级 QQ 官方机器人 SDK，极简 API 设计，~6 行代码即可启动 ✨
+
 </div>
 
 ---
@@ -23,6 +24,8 @@
 - 📦 **最小依赖** — 仅需 `aiohttp` + `pyyaml` 两个第三方库，安装即用
 - 🔧 **三协议全支持** — WebSocket / Webhook / Remote Webhook 自由切换，适配任意部署环境
 - 🌐 **全场景消息覆盖** — 频道、群聊、C2C 私聊、频道私信四大场景一站搞定
+- 🛡️ **群管理能力** — 群信息、成员与黑名单、禁言、入群申请与自动审批策略全量封装
+- 🧭 **菜单与指令面板** — 自定义菜单 + 多场景指令面板，帮助用户发现机器人能力
 - 💬 **内置会话管理器** — Session + WaitFor 多轮对话原生支持，带超时回复与 GC 回收（业界独有）
 - 🧩 **插件自动加载** — 扫描目录自动注册指令与预处理器，开箱即用的插件生态
 - 🎮 **增强指令系统** — 正则匹配 / 管理员权限 / 短路机制 / 多场景隔离 / 预处理器五合一
@@ -31,13 +34,9 @@
 - 🏷️ **现代 Python 语法** — 基于 Python 3.10+，完整类型提示，IDE 智能补全无忧
 
 ## 安装
-下载文件夹
+
 ```bash
-https://wwbup.lanzout.com/iHHEg44itnti
-```
-使用
-```bash
-pip install . --force-reinstall
+pip install easybot-qq
 ```
 
 ## 快速开始
@@ -47,21 +46,105 @@ pip install . --force-reinstall
 ```python
 from easybot import Bot, Model
 
-bot = Bot(app_id="114514", app_secret="797878")
+bot = Bot(app_id="你的AppID", app_secret="你的AppSecret")
 
-@bot.on_group_full_message
-async def handle_all(msg): # msg: Model.GroupMessage
-    bot.logger.info(f"收到群{msg.group_id} {msg.author.id} 消息: {msg.content}")
-    await msg.reply(f"收到群{msg.group_id} {msg.author.id} 消息: {msg.content}")
-
-@bot.on_c2c_message
-async def handle_c2c(msg): # msg: Model.C2CMessage
-    bot.logger.info(f"收到私聊{msg.author.id} 消息: {msg.content}")
-    await msg.reply(f"收到私聊{msg.author.id} 消息: {msg.content}")
+@bot.on_guild_message
+async def on_message(msg: Model.GuildMessage) -> None:
+    await msg.reply("Hello World!")
 
 bot.start()
 ```
 
+> 公域机器人只会收到频道内 @它 的消息；请在频道中 @机器人进行测试。
+
+### 最小错误处理（推荐）
+
+```python
+from easybot import Bot, Model, APIError, NetworkError, RateLimitError
+
+bot = Bot(app_id="你的AppID", app_secret="你的AppSecret")
+
+@bot.on_guild_message
+async def on_message(msg: Model.GuildMessage) -> None:
+    try:
+        await msg.reply(f"你说：{msg.treated_msg}")
+    except RateLimitError as e:
+        bot.logger.warning(f"触发频率限制：{e}")
+    except (APIError, NetworkError) as e:
+        bot.logger.error(f"回复失败：{e}")
+
+bot.start()
+```
+
+### 异步启动（自行管理事件循环）
+
+```python
+import asyncio
+from easybot import Bot, Model
+
+bot = Bot(app_id="你的AppID", app_secret="你的AppSecret")
+
+@bot.on_guild_message
+async def on_message(msg: Model.GuildMessage) -> None:
+    await msg.reply("Hello World!")
+
+asyncio.run(bot.start_async())
+```
+
+### 多场景消息处理 — 一个 Bot 打天下
+
+```python
+from easybot import Bot, Model
+
+bot = Bot(app_id="你的AppID", app_secret="你的AppSecret")
+
+@bot.on_guild_message
+async def handle_guild(msg: Model.GuildMessage):
+    await msg.reply(f"频道消息: {msg.treated_msg}")
+
+@bot.on_group_message
+async def handle_group(msg: Model.GroupMessage):
+    await msg.reply(f"群聊消息: {msg.treated_msg}")
+
+@bot.on_c2c_message
+async def handle_c2c(msg: Model.C2CMessage):
+    await msg.reply(f"私信消息: {msg.treated_msg}")
+
+bot.start()
+```
+
+### 亮点展示 — WaitFor 多轮对话 & 指令系统
+
+```python
+from easybot import Bot, CommandValidScenes, Model, Scope
+
+bot = Bot(app_id="你的AppID", app_secret="你的AppSecret")
+
+# 指令系统：正则 + 管理员权限 + 短路机制，一行搞定
+@bot.on_command(
+    regex=r"^查询 (.+)$",
+    is_require_admin=True,
+    valid_scenes=CommandValidScenes.GUILD,
+)
+async def query(msg: Model.GuildMessage) -> None:
+    await msg.reply(f"查询结果: {msg.treated_msg[0]}")
+
+# 会话管理：WaitFor 等待用户回复，天然支持多轮对话
+@bot.on_command(command=["签到"])
+async def check_in(
+    msg: Model.GuildMessage | Model.GroupMessage | Model.C2CMessage | Model.DirectMessage,
+) -> None:
+    with bot.session.bind(msg) as s:
+        await s.new(Scope.USER, "check_in", {"step": "confirm"})
+        await msg.reply("确认签到吗？(回复 yes/no)")
+        reply = await s.wait_for(scopes=Scope.USER, command=["yes", "no"], timeout=30)
+        if reply.content.strip() == "yes":
+            await msg.reply("✅ 签到成功！")
+        else:
+            await msg.reply("已取消签到。")
+
+bot.start()
+```
 
 ## 功能特性
 

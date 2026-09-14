@@ -546,6 +546,35 @@ await bot.api.delete_guild_member(
 ) -> bool
 ```
 
+#### 获取群成员列表（QQ 群聊）
+
+```python
+await bot.api.get_group_members(
+    group_openid: str,        # 群 OpenID
+    cursor: str | None = None,  # 分页游标，首次可不传；后续传上一次响应的 next_cursor
+) -> Model.GroupMembersResponse
+```
+
+返回 `Model.GroupMembersResponse`，包含 `members`（`list[Model.GroupMember]`）与 `next_cursor`。
+每次最多返回 30 条，`next_cursor` 为空串表示已到末页（可用 `response.is_end` 判断）。
+
+```python
+# 单页获取
+resp = await bot.api.get_group_members(msg.group_openid)
+for member in resp.members:
+    bot.logger.info(f"{member.username} / {member.member_role} / 机器人={member.bot}")
+
+# 自动翻页获取全量成员
+members = await bot.api.get_all_group_members(msg.group_openid)
+admins = [m for m in members if m.is_admin]
+```
+
+**注意**:
+
+- 该能力当前处于**内邀接入**阶段，仅白名单机器人可用
+- 无权限时返回错误码 `11253`（应用无接口访问权限），需联系平台运营申请
+- 成员角色常量见 `Model.GroupMemberRole`：`MEMBER` / `OWNER` / `ADMIN`
+
 ### 4.2 在线成员
 
 #### 获取子频道在线成员数
@@ -1207,9 +1236,240 @@ await asyncio.gather(*tasks)
 
 ---
 
-## 十五、使用建议
+## 十五、群管理 API
 
-### 15.1 错误处理
+> **权限提示**：本组接口多为**内邀 / 申请制**能力，无权限时返回错误码 `11253`（应用无接口访问权限），
+> 需要向平台运营申请。部分接口（如群成员信息、批量移除）该能力仍在内邀接入中。
+
+### 15.1 群信息与机器人状态
+
+```python
+# 获取群基本信息
+await bot.api.get_group_info(group_openid: str) -> Model.GroupInfo
+
+# 获取机器人在群内的状态（角色、消息接收设置等）
+await bot.api.get_group_bot_state(group_openid: str) -> Model.GroupBotState
+```
+
+```python
+info = await bot.api.get_group_info(msg.group_openid)
+bot.logger.info(f"{info.group_name} / {info.group_member_num} 人 / 标签 {info.group_tags}")
+
+state = await bot.api.get_group_bot_state(msg.group_openid)
+if state.only_mention:
+    bot.logger.info("当前仅接收 @ 机器人的消息")
+```
+
+### 15.2 群成员管理
+
+```python
+# 获取单个群成员信息
+await bot.api.get_group_member(group_openid: str, member_openid: str) -> Model.GroupMember
+
+# 批量移除群成员（单次最多 20 个）
+await bot.api.batch_remove_group_members(
+    group_openid: str,
+    member_openids: list[str],
+    add_to_member_blacklist: bool = False,
+) -> Model.BatchRemoveMembersResult
+```
+
+### 15.3 群黑名单
+
+```python
+# 查询黑名单（分页）
+await bot.api.get_group_member_blacklist(
+    group_openid: str, cursor: str | None = None, limit: int | None = None
+) -> Model.GroupBlacklistResponse
+
+# 通用操作：op 为 "add" / "del"，单次最多 20 个
+await bot.api.operate_group_member_blacklist(
+    group_openid: str, op: str, member_openids: list[str]
+) -> Model.GroupBlacklistOpResult
+
+# 便捷封装
+await bot.api.add_group_member_blacklist(group_openid, member_openids)
+await bot.api.remove_group_member_blacklist(group_openid, member_openids)
+```
+
+### 15.4 群禁言
+
+```python
+# 查询群禁言状态（群级规则 + 当前禁言中的成员）
+await bot.api.get_group_restrict_chat_setting(group_openid: str) -> Model.GroupRestrictChatSetting
+
+# 设置禁言：members 为配置列表，单次最多 20 个
+await bot.api.set_group_member_mute(
+    group_openid: str,
+    members: list[dict],   # {"op": "add|update|del", "member_openid": ..., "mute_expire_at": ...}
+) -> bool
+
+# 便捷封装
+await bot.api.mute_group_members(group_openid, member_openids, mute_expire_at="2026-08-05T11:23:05+08:00")
+await bot.api.unmute_group_members(group_openid, member_openids)
+```
+
+**注意**: 增加/更新禁言只能操作普通成员，不能操作群主、管理员、机器人。
+
+### 15.5 入群申请与审批
+
+```python
+# 拉取入群申请列表（单页最多 50）
+await bot.api.get_group_join_requests(
+    group_openid: str, cursor: str | None = None, limit: int | None = None
+) -> Model.JoinRequestListResponse
+
+# 审批：op 为 "approve" / "decline"
+await bot.api.approval_join_request(
+    group_openid: str,
+    member_openid: str,
+    op: str,
+    join_request_id: str | None = None,
+    reject_reason: str | None = None,
+    add_to_member_blacklist: bool = False,
+) -> bool
+
+# 便捷封装
+await bot.api.approve_join_request(group_openid, member_openid, join_request_id)
+await bot.api.decline_join_request(group_openid, member_openid, join_request_id, reject_reason="原因")
+```
+
+```python
+@bot.on_group_join_request
+async def handle_join(event: Model.GroupJoinRequestEvent) -> None:
+    bot.logger.info(f"{event.username} 申请入群，来源: {event.apply_source}")
+    await bot.api.approve_join_request(
+        event.group_openid, event.member_openid, event.join_request_id
+    )
+```
+
+**注意**: `response.requests` 对应接口返回的 `list` 字段（改名以避免与内置类型冲突）。
+
+### 15.6 入群自动审批策略
+
+```python
+# 策略列表
+await bot.api.get_join_approval_strategies(cursor=None, limit=None) -> Model.JoinApprovalStrategyListResponse
+
+# 创建策略（group_openids 与 group_ids 二选一）
+await bot.api.create_join_approval_strategy(
+    group_openids: list[str] | None = None,
+    group_ids: list[str] | None = None,
+    is_enable: str = "on",
+    expire_at: str | None = None,
+    remark: str | None = None,
+) -> Model.JoinApprovalStrategyCreated
+
+# 修改策略
+await bot.api.update_join_approval_strategy(
+    strategy_id: str,
+    is_enable: str | None = None,
+    expire_at: str | None = None,
+    group_action: dict | None = None,   # {"op": "add|del", "group_openids"/"group_ids": [...]}
+    remark: str | None = None,
+) -> Model.JoinApprovalStrategyUpdated
+
+# 删除 / 执行
+await bot.api.delete_join_approval_strategy(strategy_id: str) -> bool
+await bot.api.execute_join_approval_strategy(strategy_id: str) -> bool
+
+# 修改白名单号码（op 为 "add" / "del"，单次最多 10000 个）
+await bot.api.update_join_approval_strategy_whitelist(
+    strategy_id: str, op: str, whitelist_users: list[str]
+) -> Model.WhitelistUsersResponse
+```
+
+---
+
+## 十六、自定义菜单与指令面板 API
+
+自定义菜单展示在机器人**单聊**窗口底部；指令面板支持 `c2c`（单聊）、`group`（群聊）、`channel`（文字子频道）、`dm`（频道私信）四种场景。
+
+### 16.1 全局自定义菜单
+
+```python
+# 查询菜单
+await bot.api.get_menu() -> Model.MenuResponse
+
+# 修改菜单（覆盖式，菜单项最多 10 个）
+await bot.api.set_menu(menu: Model.Menu | dict) -> Model.MenuVersionResponse
+```
+
+```python
+await bot.api.set_menu({
+    "items": [
+        {"type": "send_message", "name": "帮助", "send_message": "/help"},
+        {"type": "link", "name": "官网", "link": "https://example.com"},
+        {"type": "menu", "name": "更多", "sub_menu_items": [
+            {"type": "send_message", "name": "设置", "send_message": "/settings"},
+        ]},
+        {"type": "switch", "name": "开关", "switch": {"switch_id": "search", "default": False}},
+    ]
+})
+```
+
+**注意**:
+- 按钮类型可选 `switch` / `send_message` / `link` / `menu`
+- `link` 必须以 `https://` 开头；`type=menu` 的二级菜单最多 5 个且不支持再嵌套
+- 频率限制 5 QPM
+
+### 16.2 指令面板
+
+```python
+# 查询面板列表（按 scope 筛选，每页最多 50）
+await bot.api.get_panels(scope: str, cursor=None, limit=None) -> Model.PanelsResponse
+
+# 创建面板
+await bot.api.create_panel(
+    scope: str,
+    panel: Model.Panel | dict,
+    target_type: str = "all",
+    user_openids: list[str] | None = None,
+    group_openids: list[str] | None = None,
+) -> Model.PanelCreateResponse
+
+# 查询详情
+await bot.api.get_panel(panel_id: str) -> Model.PanelRecord
+
+# 修改面板（覆盖元素列表与备注，不影响已关联对象）
+await bot.api.update_panel(panel_id: str, panel: Model.Panel | dict) -> Model.PanelVersionResponse
+
+# 删除面板
+await bot.api.delete_panel(panel_id: str) -> bool
+
+# 修改关联对象（op 为 "add" / "del"）
+await bot.api.update_panel_target(
+    panel_id: str, op: str,
+    user_openids: list[str] | None = None,
+    group_openids: list[str] | None = None,
+) -> bool
+```
+
+```python
+result = await bot.api.create_panel(
+    scope="group",
+    target_type="specific",
+    group_openids=[msg.group_openid],
+    panel={
+        "items": [
+            {"type": "command", "name": "签到", "desc": "每日签到"},
+            {"type": "link", "name": "更多服务", "link": "https://example.com"},
+        ],
+        "remark": "群聊面板",
+    },
+)
+bot.logger.info(f"面板已创建: {result.panel_id}")
+```
+
+**注意**:
+- `channel` 与 `dm` 场景**仅支持** `target_type=all`
+- 面板元素最多 20 个；`type` 可选 `command` / `link`
+
+---
+
+## 十七、使用建议
+
+### 17.1 错误处理
 
 API 调用可能失败，建议使用 try-except 处理：
 
@@ -1222,7 +1482,9 @@ except APIError as e:
     bot.logger.error(f"发送消息失败: {e}")
 ```
 
-### 15.2 批量操作
+> SDK 会同时兼容官方新错误体字段 `err_code` 与旧字段 `code`，`APIError.code` 始终为业务错误码。
+
+### 17.2 批量操作
 
 对于批量操作（如批量禁言），使用批量 API 而不是循环调用单个 API：
 
@@ -1237,7 +1499,7 @@ for user_id in user_ids:
 
 ---
 
-## 十六、下一步
+## 十八、下一步
 
 - [Messages Model](./05_Messages_Model.md) — 掌握各种消息类型的构建方法
 - [插件与权限](./07_插件与权限.md) — 学习插件开发和命令注册

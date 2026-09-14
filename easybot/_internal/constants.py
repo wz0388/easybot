@@ -47,9 +47,20 @@ PERMISSION_DENIED_CODES: set[int] = {
     501017,
 }
 
-API_BASE_URL: str = "https://api.sgroup.qq.com"
+# API 域名
+# 2026-08-10 起官方将所有接口调用域名统一为 api.bot.qq.com
+API_BASE_URL: str = "https://api.bot.qq.com"
+# 旧域名，仅在主域名不可达（DNS / 连接失败）时自动降级使用
+API_BASE_URL_FALLBACK: str = "https://api.sgroup.qq.com"
+
+# 沙箱域名，官方文档暂未公布新版地址，主域名沿用旧值，
+# 仅在不可达时尝试启用同构的 bot.qq.com 沙箱域名
 SANDBOX_API_BASE_URL: str = "https://sandbox.api.sgroup.qq.com"
-TOKEN_API_URL: str = "https://bots.qq.com/app/getAppAccessToken"
+SANDBOX_API_BASE_URL_FALLBACK: str = "https://sandbox.api.bot.qq.com"
+
+# 获取 access_token 的接口地址
+TOKEN_API_URL: str = "https://api.bot.qq.com/app/getAppAccessToken"
+TOKEN_API_URL_FALLBACK: str = "https://bots.qq.com/app/getAppAccessToken"
 
 GUILD_EVENTS: set[str] = {
     "GUILD_CREATE",
@@ -72,6 +83,9 @@ GROUP_EVENTS: set[str] = {
     "GROUP_DEL_ROBOT",
     "GROUP_MSG_REJECT",
     "GROUP_MSG_RECEIVE",
+    "GROUP_JOIN_REQUEST",
+    "GROUP_MEMBER_ADD",
+    "GROUP_MEMBER_REMOVE",
 }
 
 C2C_EVENTS: set[str] = {
@@ -109,6 +123,10 @@ EVENT_DISPLAY_NAMES: dict[str, str] = {
     "GROUP_DEL_ROBOT": "退出群聊",
     "GROUP_MSG_REJECT": "群聊拒绝消息",
     "GROUP_MSG_RECEIVE": "群聊接受消息",
+    "GROUP_JOIN_REQUEST": "用户申请加群",
+    "GROUP_MEMBER_ADD": "群成员加入",
+    "GROUP_MEMBER_REMOVE": "群成员退出",
+    "SUBSCRIBE_MESSAGE_STATUS": "订阅消息授权状态变更",
     "FRIEND_ADD": "添加好友",
     "FRIEND_DEL": "删除好友",
     "C2C_MSG_REJECT": "私聊拒绝消息",
@@ -190,6 +208,10 @@ _EVENT_MODEL_MAP: dict[str, Any] = {
     "GROUP_DEL_ROBOT": Model.GroupEvent,
     "GROUP_MSG_REJECT": Model.GroupEvent,
     "GROUP_MSG_RECEIVE": Model.GroupEvent,
+    "GROUP_JOIN_REQUEST": Model.GroupJoinRequestEvent,
+    "GROUP_MEMBER_ADD": Model.GroupMemberEvent,
+    "GROUP_MEMBER_REMOVE": Model.GroupMemberEvent,
+    "SUBSCRIBE_MESSAGE_STATUS": Model.SubscribeMessageStatusEvent,
     "FRIEND_ADD": Model.FriendEvent,
     "FRIEND_DEL": Model.FriendEvent,
     "C2C_MSG_REJECT": Model.FriendEvent,

@@ -22,10 +22,13 @@ from ..exceptions import APIError, AuthenticationError, NetworkError
 from ..models import Model
 from .constants import (
     API_BASE_URL,
+    API_BASE_URL_FALLBACK,
     PERMISSION_DENIED_CODES,
     RETRYABLE_CODES,
     SANDBOX_API_BASE_URL,
+    SANDBOX_API_BASE_URL_FALLBACK,
     TOKEN_API_URL,
+    TOKEN_API_URL_FALLBACK,
 )
 
 if TYPE_CHECKING:
@@ -209,6 +212,45 @@ class HTTPClient:
         self._token_expires_at: float = 0
         self._logger = bot.logger.with_module("http")
         self._has_connector_ref: bool = False
+        # 当前生效的 API 域名（主域名不可达时降级为旧域名并缓存）
+        self._active_base_url: str | None = None
+
+    def _primary_base_url(self) -> str:
+        """获取首选 API 域名"""
+        return SANDBOX_API_BASE_URL if self._bot.is_sandbox else API_BASE_URL
+
+    def _fallback_base_url(self, current: str) -> str | None:
+        """
+        获取当前域名的降级备选域名
+
+        2026-08-10 官方将接口域名统一为 api.bot.qq.com，
+        旧域名在此仅作为主域名 DNS / 连接失败时的兜底。
+        """
+        if self._bot.is_sandbox:
+            return (
+                SANDBOX_API_BASE_URL_FALLBACK
+                if current == SANDBOX_API_BASE_URL
+                else None
+            )
+        return API_BASE_URL_FALLBACK if current == API_BASE_URL else None
+
+    @staticmethod
+    def _extract_error_code(data: dict[str, Any], status: int) -> int:
+        """
+        从错误响应体中提取业务错误码
+
+        官方新错误体格式为 ``{"err_code": ..., "message": ..., "trace_id": ...}``，
+        旧格式与 access_token 接口使用 ``code`` 字段，两者都做兼容；
+        均不存在时回退为 HTTP 状态码。
+        """
+        for key in ("err_code", "code"):
+            value = data.get(key)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return status
 
     @classmethod
     def _get_state(cls, bot_id: str) -> _ConnectorState:
@@ -316,7 +358,10 @@ class HTTPClient:
 
         session = await self._get_session()
 
-        url = TOKEN_API_URL
+        # 主域名优先，DNS / 连接失败时降级到旧域名
+        urls = [TOKEN_API_URL]
+        if TOKEN_API_URL_FALLBACK != TOKEN_API_URL:
+            urls.append(TOKEN_API_URL_FALLBACK)
 
         payload = {
             "appId": self._bot.app_id,
@@ -327,36 +372,71 @@ class HTTPClient:
 
         self._logger.debug("正在获取新的 access_token...")
 
-        try:
-            async with session.post(url, json=payload, headers=headers) as response:
-                data = await response.json()
-
-                if response.status != 200:
-                    self._logger.error(
-                        f"获取 access_token 失败: HTTP {response.status}, response={data}"
+        for index, url in enumerate(urls):
+            try:
+                return await self._request_access_token(
+                    session, url, payload, headers
+                )
+            except aiohttp.ClientConnectorError as e:
+                next_url = urls[index + 1] if index + 1 < len(urls) else None
+                if next_url:
+                    self._logger.warning(
+                        f"Token 域名 {url} 连接失败，降级到 {next_url} 重试: {e}"
                     )
-                    raise AuthenticationError(f"获取 access_token 失败: {data}")
+                    continue
+                self._logger.error(f"获取 access_token 网络错误: {e}")
+                raise NetworkError(f"网络错误: {e}")
+            except aiohttp.ClientError as e:
+                self._logger.error(f"获取 access_token 网络错误: {e}")
+                raise NetworkError(f"网络错误: {e}")
 
-                if data.get("code", 0) != 0:
-                    self._logger.error(
-                        f"获取 access_token 失败: code={data.get('code')}, message={data.get('message')}"
-                    )
-                    raise AuthenticationError(
-                        f"获取 access_token 失败: [{data.get('code')}] {data.get('message')}"
-                    )
+        raise NetworkError("获取 access_token 失败: 所有域名均不可达")
 
-                self._access_token = data["access_token"]
-                expires_in = data.get("expires_in", 7200)
-                if isinstance(expires_in, str):
-                    expires_in = int(expires_in)
-                self._token_expires_at = time.time() + expires_in
+    async def _request_access_token(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> str:
+        """
+        向指定域名请求 access_token
 
-                self._logger.debug(f"access_token 获取成功，有效期: {expires_in}秒")
-                return self._access_token
+        Args:
+            session: aiohttp 会话
+            url: Token 接口地址
+            payload: 请求体
+            headers: 请求头
 
-        except aiohttp.ClientError as e:
-            self._logger.error(f"获取 access_token 网络错误: {e}")
-            raise NetworkError(f"网络错误: {e}")
+        Returns:
+            access_token 字符串
+        """
+        async with session.post(url, json=payload, headers=headers) as response:
+            data = await response.json()
+
+            if response.status != 200:
+                self._logger.error(
+                    f"获取 access_token 失败: HTTP {response.status}, response={data}"
+                )
+                raise AuthenticationError(f"获取 access_token 失败: {data}")
+
+            # 兼容 code 与 err_code 两种错误码字段
+            raw_code = data.get("err_code", data.get("code"))
+            if raw_code not in (None, 0, "0"):
+                self._logger.error(
+                    f"获取 access_token 失败: code={raw_code}, message={data.get('message')}"
+                )
+                raise AuthenticationError(
+                    f"获取 access_token 失败: [{raw_code}] {data.get('message')}"
+                )
+
+            self._access_token = data["access_token"]
+            expires_in = data.get("expires_in", 7200)
+            if isinstance(expires_in, str):
+                expires_in = int(expires_in)
+            self._token_expires_at = time.time() + expires_in
+            self._logger.debug(f"access_token 获取成功，有效期: {expires_in}秒")
+            return self._access_token
 
     async def request(
         self,
@@ -380,8 +460,7 @@ class HTTPClient:
             NetworkError: 网络错误时抛出
         """
         session = await self._get_session()
-        base_url = SANDBOX_API_BASE_URL if self._bot.is_sandbox else API_BASE_URL
-        url = f"{base_url}{endpoint}"
+        base_url = self._active_base_url or self._primary_base_url()
 
         access_token = await self.get_access_token()
         headers = kwargs.pop("headers", {})
@@ -399,15 +478,20 @@ class HTTPClient:
 
         retry_count = 0
         max_retry = self._bot.is_retry
+        tried_fallback = False
 
         self._logger.debug(f"API 请求: {method} {endpoint}")
 
         while retry_count <= max_retry:
+            url = f"{base_url}{endpoint}"
             try:
                 async with session.request(
                     method, url, headers=headers, **kwargs
                 ) as response:
                     trace_id = response.headers.get("X-Tps-trace-ID")
+
+                    # 缓存可用域名，避免后续重复探测
+                    self._active_base_url = base_url
 
                     if response.status == 204:
                         self._logger.debug(
@@ -420,11 +504,19 @@ class HTTPClient:
                     except Exception:
                         data = {}
 
-                    if response.status == 200:
-                        self._logger.debug(f"API 响应: {method} {endpoint} -> 200 OK")
+                    # TraceID 可来自响应头或响应体，优先响应头
+                    if trace_id is None and isinstance(data, dict):
+                        trace_id = data.get("trace_id")
+
+                    # 200 正常成功；201/202 为异步操作受理成功
+                    # （回调体内可能携带 304023/304024 等「异步受理」业务码，仍属成功）
+                    if response.status in (200, 201, 202):
+                        self._logger.debug(
+                            f"API 响应: {method} {endpoint} -> {response.status}"
+                        )
                         return data
 
-                    code = data.get("code", response.status)
+                    code = self._extract_error_code(data, response.status)
                     message = data.get("message", "Unknown error")
 
                     if code in RETRYABLE_CODES and retry_count < max_retry:
@@ -451,6 +543,28 @@ class HTTPClient:
                         )
 
                     raise APIError(code, message, trace_id)
+
+            except aiohttp.ClientConnectorError as e:
+                # 域名不可达时降级到备选域名重试一次（不影响重试计数）
+                fallback = self._fallback_base_url(base_url)
+                if fallback and not tried_fallback:
+                    tried_fallback = True
+                    self._logger.warning(
+                        f"域名 {base_url} 连接失败，降级到 {fallback} 重试: {e}"
+                    )
+                    base_url = fallback
+                    self._active_base_url = fallback
+                    continue
+                if retry_count < max_retry:
+                    retry_count += 1
+                    wait_time = 1 * retry_count
+                    self._logger.warning(
+                        f"网络错误: {e}, 第 {retry_count}/{max_retry} 次重试，等待 {wait_time}秒"
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                self._logger.error(f"网络错误 (已达最大重试次数): {e}")
+                raise NetworkError(f"网络错误: {e}")
 
             except aiohttp.ClientError as e:
                 if retry_count < max_retry:
