@@ -36,7 +36,7 @@
 ## 安装
 
 ```bash
-pip install easybot-qq
+pip install git+https://github.com/wz0388/easybot.git
 ```
 
 ## 快速开始
@@ -46,11 +46,13 @@ pip install easybot-qq
 ```python
 from easybot import Bot, Model
 
-bot = Bot(app_id="你的AppID", app_secret="你的AppSecret")
+bot = Bot(app_id="114522352", app_secret="sk-crazythursdayvme50"",is_debug=True )
 
-@bot.on_guild_message
-async def on_message(msg: Model.GuildMessage) -> None:
-    await msg.reply("Hello World!")
+
+@bot.on_group_full_message
+async def handle_all(msg): # msg: Model.GroupMessage
+    bot.logger.info(f"收到群{msg.group_id} {msg.author.id} 消息: {msg.content}")
+    await msg.reply(msg)
 
 bot.start()
 ```
@@ -178,22 +180,6 @@ bot.start()
 | ⏰ **生命周期** | startup / shutdown / timer 三大内置事件 |
 | 🔒 **沙箱模式** | 一键开启沙箱环境，安全调试不干扰线上 |
 
-## 文档
-
-完整文档请参阅 [docs](https://github.com/SaucePlum/easybot/tree/main/docs) 目录：
-
-| 文档 | 内容 |
-|------|------|
-| [简介](https://github.com/SaucePlum/easybot/blob/main/docs/01_简介.md) | 设计理念、核心价值、与其他方案对比 |
-| [快速入门](https://github.com/SaucePlum/easybot/blob/main/docs/02_快速入门.md) | 从安装到第一个机器人的完整指南 |
-| [SDK 组件](https://github.com/SaucePlum/easybot/blob/main/docs/03_SDK组件.md) | Bot / API / Protocol / Logger 等核心组件详解 |
-| [API 参考](https://github.com/SaucePlum/easybot/blob/main/docs/04_API参考.md) | 完整 API 接口文档 |
-| [Messages Model](https://github.com/SaucePlum/easybot/blob/main/docs/05_Messages_Model.md) | 消息构建器（Embed / Ark / Markdown 等）|
-| [Model 库](https://github.com/SaucePlum/easybot/blob/main/docs/06_Model库.md) | 数据模型定义与字段说明 |
-| [插件与权限](https://github.com/SaucePlum/easybot/blob/main/docs/07_插件与权限.md) | 插件开发、指令系统、权限管理 |
-| [Session 会话管理器](https://github.com/SaucePlum/easybot/blob/main/docs/08_Session会话管理器.md) | 会话 API 与 WaitFor 多轮对话详解 |
-| [常见问题 Q&A](https://github.com/SaucePlum/easybot/blob/main/docs/09_常见问题Q&A.md) | FAQ 与问题排查 |
-| [联系和反馈](https://github.com/SaucePlum/easybot/blob/main/docs/10_联系和反馈.md) | 问题提交与社区交流 |
 
 ## 环境要求
 
@@ -211,7 +197,7 @@ bot.start()
 
 本项目采用 [MIT](LICENSE) 许可证。
 
-## 联系方式
+## 原作者
 
 - 作者：小念同学
 - 邮箱：2660422452@qq.com
